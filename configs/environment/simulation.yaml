@@ -1,0 +1,56 @@
+# Simulation timing and general parameters
+start_time: "2023-01-01T00:00:00Z"
+
+# Communication link parameters
+isl_frequency_ghz: 26.5  # Ka-band for inter-satellite links
+downlink_frequency_ghz: 12.0 # Ku-band for satellite to ground
+
+# Deep Learning Model parameters
+dl_model:
+  flops_per_pixel: 1000 # Example value: FLOPs needed to process one pixel
+  output_classes: 10    # Example value: Number of classes for the model output
+
+# Ground Station parameters
+ground_station:
+  # Automatically generate a grid of ground stations over the target area
+  generation_method: "hex_grid"
+  grid_radius_km: 22.60
+  # Default compute capacity for each auto-generated ground station
+  compute_gflops: 1000.0
+
+# Task Generation parameters
+task_generation:
+  image_size_range: [1024, 4096] # Min/max image width/height in pixels
+  bands_range: [3, 8]            # Min/max number of spectral bands
+  interval_range_sec: [60, 300]  # A new task is generated every 1-5 minutes
+
+# Slicing strategies for hierarchical actions
+# Defines the available options for the 'slice_strategy' action
+slicing_strategies:
+  - slice_size: 128
+    overlap_ratios: [0, 0.1, 0.15, 0.25, 0.5]
+  - slice_size: 256
+    overlap_ratios: [0, 0.1, 0.15, 0.25, 0.5]
+  - slice_size: 512
+    overlap_ratios: [0, 0.1, 0.15, 0.25, 0.5]
+  - slice_size: 1024
+    overlap_ratios: [0, 0.1, 0.15, 0.25, 0.5]
+  - slice_size: 2048
+    overlap_ratios: [0, 0.1, 0.15, 0.25, 0.5]
+
+# Target area for remote sensing tasks and UE generation
+target_area:
+  min_lon_deg: 0.0
+  max_lon_deg: 110.0
+  min_lat_deg: -60.0
+  max_lat_deg: 60.0
+
+# Ground user equipment (UE) parameters
+user_equipment:
+  num_ues: 50 # Total number of UEs to be created in the target area
+  uplink_frequency_ghz: 1.6 # L-band for UE to satellite uplink
+  # Task generation parameters specific to UEs
+  task_generation:
+    image_size_range: [512, 2048]
+    bands_range: [1, 3]
+    bits_per_pixel: 8

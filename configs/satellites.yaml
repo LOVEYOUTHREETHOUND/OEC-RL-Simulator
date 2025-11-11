@@ -1,0 +1,63 @@
+# Constellation configuration with a large-scale, multi-plane LEO constellation.
+# TLE data is now fetched automatically from CelesTrak by the check_constellation.py script.
+
+# --- Remote Sensing Satellites (Data Sources) ---
+source_satellites:
+  - { sat_id: 41460, name: "GAOFEN-3" }
+  - { sat_id: 43641, name: "GAOFEN-1 02" }
+  - { sat_id: 39210, name: "GAOFEN-2" }
+  - { sat_id: 43430, name: "GAOFEN-5" }
+  - { sat_id: 43506, name: "GAOFEN-6" }
+  - { sat_id: 44710, name: "GAOFEN-7" }
+  - { sat_id: 45672, name: "GAOFEN-9" }
+  - { sat_id: 45681, name: "GAOFEN-9 02" }
+  - { sat_id: 46227, name: "GAOFEN-9 03" }
+  - { sat_id: 46989, name: "GAOFEN-9 04" }
+  - { sat_id: 48234, name: "GAOFEN-9 05" }
+  - { sat_id: 43811, name: "GAOFEN-11 02" }
+  - { sat_id: 46920, name: "GAOFEN-11 03" }
+  - { sat_id: 54238, name: "GAOFEN-11 04" }
+
+# --- LEO Computing Constellation (Data Processors) ---
+# An expanded subset of Starlink satellites from 4 different orbital planes
+compute_satellites:
+  # Group 7-5 (18 satellites)
+  - { sat_id: 57934, name: "STARLINK-5896", compute_gflops: 150.0 }
+  - { sat_id: 57935, name: "STARLINK-5897", compute_gflops: 150.0 }
+  - { sat_id: 57936, name: "STARLINK-5898", compute_gflops: 150.0 }
+  - { sat_id: 57937, name: "STARLINK-5899", compute_gflops: 150.0 }
+  - { sat_id: 57938, name: "STARLINK-5900", compute_gflops: 150.0 }
+  - { sat_id: 57939, name: "STARLINK-5901", compute_gflops: 150.0 }
+  - { sat_id: 57940, name: "STARLINK-5902", compute_gflops: 150.0 }
+  - { sat_id: 57941, name: "STARLINK-5903", compute_gflops: 150.0 }
+  - { sat_id: 57942, name: "STARLINK-5904", compute_gflops: 150.0 }
+  - { sat_id: 57943, name: "STARLINK-5905", compute_gflops: 150.0 }
+  - { sat_id: 57944, name: "STARLINK-5906", compute_gflops: 150.0 }
+  - { sat_id: 57945, name: "STARLINK-5907", compute_gflops: 150.0 }
+  - { sat_id: 57946, name: "STARLINK-5908", compute_gflops: 150.0 }
+  - { sat_id: 57947, name: "STARLINK-5909", compute_gflops: 150.0 }
+  - { sat_id: 57948, name: "STARLINK-5910", compute_gflops: 150.0 }
+  - { sat_id: 57949, name: "STARLINK-5911", compute_gflops: 150.0 }
+  - { sat_id: 57950, name: "STARLINK-5912", compute_gflops: 150.0 }
+  - { sat_id: 57951, name: "STARLINK-5913", compute_gflops: 150.0 }
+
+  # Group 7-6 (18 satellites)
+  - { sat_id: 58111, name: "STARLINK-6531", compute_gflops: 150.0 }
+  - { sat_id: 58112, name: "STARLINK-6532", compute_gflops: 150.0 }
+  - { sat_id: 58113, name: "STARLINK-6533", compute_gflops: 150.0 }
+  - { sat_id: 58114, name: "STARLINK-6534", compute_gflops: 150.0 }
+  - { sat_id: 58115, name: "STARLINK-6535", compute_gflops: 150.0 }
+
+  # Group 7-7 (18 satellites)
+  - { sat_id: 58331, name: "STARLINK-6031", compute_gflops: 150.0 }
+  - { sat_id: 58332, name: "STARLINK-6032", compute_gflops: 150.0 }
+  - { sat_id: 58333, name: "STARLINK-6033", compute_gflops: 150.0 }
+  - { sat_id: 58334, name: "STARLINK-6034", compute_gflops: 150.0 }
+  - { sat_id: 58335, name: "STARLINK-6035", compute_gflops: 150.0 }
+
+  # Group 7-8 (18 satellites)
+  - { sat_id: 58551, name: "STARLINK-6201", compute_gflops: 150.0 }
+  - { sat_id: 58552, name: "STARLINK-6202", compute_gflops: 150.0 }
+  - { sat_id: 58553, name: "STARLINK-6203", compute_gflops: 150.0 }
+  - { sat_id: 58554, name: "STARLINK-6204", compute_gflops: 150.0 }
+  - { sat_id: 58555, name: "STARLINK-6205", compute_gflops: 150.0 }

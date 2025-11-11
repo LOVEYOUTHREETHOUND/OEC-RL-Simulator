@@ -1,0 +1,42 @@
+# Basic simulation configuration for the SatelliteEnv
+
+# --- Simulation Time ---
+start_time: '2024-01-01T00:00:00Z'
+
+# --- Hierarchical Learning Parameters ---
+# Defines the hierarchical slicing strategies for the meta-controller
+slicing_strategies:
+  - slice_size: 128
+    overlap_ratios: [0, 0.1, 0.15, 0.25, 0.5]
+  - slice_size: 256
+    overlap_ratios: [0, 0.1, 0.15, 0.25, 0.5]
+  - slice_size: 512
+    overlap_ratios: [0, 0.1, 0.15, 0.25, 0.5]
+  - slice_size: 1024
+    overlap_ratios: [0, 0.1, 0.15, 0.25, 0.5]
+  - slice_size: 2048
+    overlap_ratios: [0, 0.1, 0.15, 0.25, 0.5]
+
+# --- Communication Frequencies ---
+isl_frequency_ghz: 230.0  # Inter-Satellite Link frequency in GHz (in THz band)
+downlink_frequency_ghz: 12.0 # Downlink frequency in GHz (Ku-band)
+
+# --- Ground Station Properties ---
+ground_station:
+  # ECEF position of a sample ground station (e.g., in Madrid, Spain)
+  position_ecef_km: [4844.5, -350.5, 4118.2]
+  compute_gflops: 10000.0 # Powerful ground station compute capacity
+
+# --- Deep Learning Model Properties ---
+dl_model:
+  # FLOPs per pixel for the segmentation model. This is a representative value.
+  flops_per_pixel: 1000
+  # Number of output classes for the segmentation task
+  output_classes: 19
+
+# --- Task Generation Parameters ---
+task_generation:
+  image_width_range: [2048, 2048]
+  image_height_range: [2048, 2048]
+  bands_range: [7, 7]
+  bits_per_pixel: 8

@@ -1,0 +1,20 @@
+# Configuration for the Hierarchical RL Agent
+
+# Defines the discrete slice choices for the meta-controller
+slice_strategies: [4, 9, 16]
+
+# Parameters for the underlying PPO models (both meta-controller and controllers)
+# These are standard stable-baselines3 PPO parameters.
+ppo_params:
+  policy: 'MultiInputPolicy'
+  learning_rate: 0.0003
+  n_steps: 2048
+  batch_size: 64
+  n_epochs: 10
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  ent_coef: 0.0
+  verbose: 1
+  tensorboard_log: './results/logs/hrl_agent/'
+

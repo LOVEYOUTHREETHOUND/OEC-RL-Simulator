@@ -1,0 +1,17 @@
+# Core RL and simulation libraries
+gymnasium
+numpy
+scipy
+skyfield
+
+# Configuration and utilities
+pyyaml
+tqdm
+
+# Visualization
+matplotlib
+
+# Reinforcement Learning Agent Framework
+# We install stable-baselines3 as it's a dependency for our HRL agent structure
+stable-baselines3[extra]
+
