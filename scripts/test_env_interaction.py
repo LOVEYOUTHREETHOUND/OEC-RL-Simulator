@@ -111,6 +111,7 @@ def print_task_dynamics(env, info):
     """Prints a detailed breakdown of task generation and queue status."""
     print("\n--- Task Dynamics ---")
     print(f"> Tasks in Queue ({len(env.task_queue)}): {list(env.task_queue)}")
+    print(f"> Completed Tasks ({len(env.completed_tasks)}): {list(env.completed_tasks)}")
     
     for key, label in [
         ('newly_generated_rs_tasks', 'Newly Generated RS Tasks'),

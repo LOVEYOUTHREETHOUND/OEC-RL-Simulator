@@ -64,6 +64,7 @@ class SatelliteEnv(gym.Env):
         self.task_queue: deque[Task] = deque()
         self.uplink_buffer: List[Tuple[datetime, Task, int]] = []
         self.pending_ue_tasks: deque[Tuple[UserEquipment, Task]] = deque()
+        self.completed_tasks: deque[Task] = deque()
         self.current_task: Optional[Task] = None
         self.steps_taken = 0
 
@@ -248,6 +249,7 @@ class SatelliteEnv(gym.Env):
         self.task_queue.clear()
         self.uplink_buffer.clear()
         self.pending_ue_tasks.clear()
+        self.completed_tasks.clear()
 
         for sat in self.compute_satellites:
             sat.task_queue.clear()
@@ -290,6 +292,11 @@ class SatelliteEnv(gym.Env):
                     t_isl = (num_slices_for_dest * slice_data_size_bits) / isl_capacity if isl_capacity > 0 else np.inf
                     t_queue = target_sat.queue_load_flops / (target_sat.compute_gflops * 1e9)
                     t_comp = (num_slices_for_dest * slice_flops) / (target_sat.compute_gflops * 1e9)
+                    
+                    # Add the task to the satellite's queue
+                    task_flops = num_slices_for_dest * slice_flops
+                    target_sat.add_task_to_queue(task_flops)
+                    
                     dist_down = links.get_distance_km(target_sat.position_ecef, self.ground_stations[0].position_ecef) # Simplified: all results to first GS
                     down_capacity = links.get_downlink_capacity_bps(dist_down, self.downlink_frequency_ghz)
                     t_down = (num_slices_for_dest * slice_result_size_bits) / down_capacity if down_capacity > 0 else np.inf
@@ -303,6 +310,9 @@ class SatelliteEnv(gym.Env):
 
     def step(self, action: Dict[str, np.ndarray]) -> Tuple[Dict[str, np.ndarray], float, bool, bool, Dict[str, Any]]:
         info = {}
+        if self.current_task:
+            self.completed_tasks.append(self.current_task)
+
         if not self.current_task:
             wait_log = self._get_next_task()
             obs = self._get_obs()

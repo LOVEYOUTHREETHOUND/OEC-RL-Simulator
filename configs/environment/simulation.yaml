@@ -14,7 +14,7 @@ dl_model:
 ground_station:
   # Automatically generate a grid of ground stations over the target area
   generation_method: "hex_grid"
-  grid_radius_km: 22.60
+  grid_radius_km: 220.60
   # Default compute capacity for each auto-generated ground station
   compute_gflops: 1000.0
 
