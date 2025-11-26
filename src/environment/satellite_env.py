@@ -53,7 +53,11 @@ class SatelliteEnv(gym.Env):
 
         self.source_satellites = [Satellite(sat_id=cfg['sat_id'], config=cfg) for cfg in sat_configs['source_satellites']]
         self.compute_satellites = [Satellite(sat_id=cfg['sat_id'], config=cfg) for cfg in sat_configs['compute_satellites']]
-        self.all_satellites = self.source_satellites + self.compute_satellites
+        # Optional MEO leader satellites
+        self.leader_satellites = [Satellite(sat_id=cfg['sat_id'], config=cfg) for cfg in sat_configs.get('leader_satellites', [])]
+        self.num_leader_satellites = len(self.leader_satellites)
+
+        self.all_satellites = self.source_satellites + self.compute_satellites + self.leader_satellites
         self.num_compute_satellites = len(self.compute_satellites)
 
         # There are no UEs anymore; keep attribute for compatibility with scripts
@@ -207,24 +211,37 @@ class SatelliteEnv(gym.Env):
         # No explicit result size provided in the new model; assume negligible
         slice_result_size_bits = 0.0
 
+        # Determine leader satellite (nearest MEO leader). If none configured, fall back to source-as-leader (legacy path)
+        if self.num_leader_satellites > 0:
+            dists = [links.get_distance_km(source_sat.position_ecef, ldr.position_ecef) for ldr in self.leader_satellites]
+            leader_idx = int(np.argmin(dists))
+            leader_sat = self.leader_satellites[leader_idx]
+            # Initial hop: source RS -> leader via ISL, send full data once
+            dist_rs_leader = dists[leader_idx]
+            isl_cap_rs_leader = links.get_isl_capacity_bps(dist_rs_leader, self.isl_frequency_ghz)
+            t_initial = (self.current_task.data_size_bits) / isl_cap_rs_leader if isl_cap_rs_leader > 0 else np.inf
+        else:
+            leader_sat = source_sat
+            t_initial = 0.0
+
         latencies: List[float] = []
         for dest_id, group in itertools.groupby(sorted(enumerate(assignment[:k]), key=lambda x: x[1]), key=lambda x: x[1]):
             num_slices_for_dest = len(list(group))
 
             if 0 <= dest_id < self.num_ground_stations:
-                # Destination is a Ground Station: downlink raw data then compute on GS
+                # Destination is a Ground Station (cloud): leader downlinks raw slices, then compute on ground
                 gs = self.ground_stations[dest_id]
-                dist = links.get_distance_km(source_sat.position_ecef, gs.position_ecef)
+                dist = links.get_distance_km(leader_sat.position_ecef, gs.position_ecef)
                 capacity = links.get_downlink_capacity_bps(dist, self.downlink_frequency_ghz)
                 t_trans = (num_slices_for_dest * slice_data_size_bits) / capacity if capacity > 0 else np.inf
                 t_comp = (num_slices_for_dest * slice_flops) / (gs.compute_gflops * 1e9)
-                latencies.append(t_trans + t_comp)
+                latencies.append(t_initial + t_trans + t_comp)
             else:
-                # Destination is a Compute Satellite
+                # Destination is a LEO Compute Satellite: leader sends raw slices via ISL to LEO, then queue+compute
                 sat_idx = dest_id - self.num_ground_stations
                 if 0 <= sat_idx < self.num_compute_satellites:
                     target_sat = self.compute_satellites[sat_idx]
-                    dist_isl = links.get_distance_km(source_sat.position_ecef, target_sat.position_ecef)
+                    dist_isl = links.get_distance_km(leader_sat.position_ecef, target_sat.position_ecef)
                     isl_capacity = links.get_isl_capacity_bps(dist_isl, self.isl_frequency_ghz)
                     t_isl = (num_slices_for_dest * slice_data_size_bits) / isl_capacity if isl_capacity > 0 else np.inf
                     t_queue = target_sat.queue_load_flops / (target_sat.compute_gflops * 1e9)
@@ -234,7 +251,7 @@ class SatelliteEnv(gym.Env):
                     target_sat.add_task_to_queue(task_flops)
                     # Result downlink assumed negligible
                     t_down = 0.0
-                    latencies.append(t_isl + t_queue + t_comp + t_down)
+                    latencies.append(t_initial + t_isl + t_queue + t_comp + t_down)
 
         total_latency_sec = max(latencies) if latencies else 0.0
         # Enforce max latency constraint: zero reward if violated
