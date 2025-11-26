@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
 This module defines the main reinforcement learning environment, SatelliteEnv,
-updated to support a more complex, multi-tasking simulation environment with
-a grid of ground stations.
+updated to a unified-task setting: there is only one type of task, which is
+assumed to already be available on a source (remote-sensing) satellite when it
+is over the target area. We do not model UE-originated tasks or uplinks anymore.
 """
 
 from typing import Dict, Any, List, Tuple, Optional
-from datetime import datetime, timedelta
+from datetime import datetime
 from collections import deque
 import itertools
 import math
@@ -16,15 +17,15 @@ from gymnasium import spaces
 import numpy as np
 
 from src.environment.components.satellite import Satellite
-from src.environment.components.ue import UserEquipment
 from src.environment.components.ground_station import GroundStation
 from src.environment.components.task_generator import Task, TaskGenerator
 from src.physics.orbits import OrbitPropagator
 from src.physics import links, constants
 from src.utils.geo import generate_hex_grid_centers
 
+
 class SatelliteEnv(gym.Env):
-    """Custom Environment for Satellite Edge Computing Simulation with dynamic task generation."""
+    """Custom Environment for Satellite Edge Computing Simulation with unified task generation."""
     metadata = {'render_modes': ['human']}
 
     def __init__(self, sim_config: Dict[str, Any], sat_configs: Dict[str, List[Dict[str, Any]]]):
@@ -37,33 +38,32 @@ class SatelliteEnv(gym.Env):
         self.start_time = datetime.fromisoformat(sim_config['start_time'].replace('Z', '+00:00'))
         self.isl_frequency_ghz = sim_config['isl_frequency_ghz']
         self.downlink_frequency_ghz = sim_config['downlink_frequency_ghz']
-        self.ue_uplink_frequency_ghz = sim_config['user_equipment']['uplink_frequency_ghz']
-        self.dl_model_flops_per_pixel = sim_config['dl_model']['flops_per_pixel']
-        self.dl_model_output_classes = sim_config['dl_model']['output_classes']
         self.slicing_strategies = sim_config.get('slicing_strategies', [])
         self.max_episode_steps = sim_config.get('max_episode_steps', 500)
 
         # --- Initialize Environment Components ---
         self.orbit_propagator = OrbitPropagator(self.start_time)
+        # TaskGenerator now unified; derive required FLOPs using flops_per_pixel
+        flops_per_pixel = float(sim_config.get('dl_model', {}).get('flops_per_pixel', 1000.0))
         self.task_generator = TaskGenerator(
-            rs_config=sim_config['task_generation'],
-            ue_config=sim_config['user_equipment']['task_generation'],
-            area_config=sim_config['target_area']
+            task_config=sim_config['task_generation'],
+            area_config=sim_config['target_area'],
+            flops_per_pixel=flops_per_pixel,
         )
 
         self.source_satellites = [Satellite(sat_id=cfg['sat_id'], config=cfg) for cfg in sat_configs['source_satellites']]
         self.compute_satellites = [Satellite(sat_id=cfg['sat_id'], config=cfg) for cfg in sat_configs['compute_satellites']]
         self.all_satellites = self.source_satellites + self.compute_satellites
         self.num_compute_satellites = len(self.compute_satellites)
-        
-        self.ground_ues = self._init_ues()
+
+        # There are no UEs anymore; keep attribute for compatibility with scripts
+        self.ground_ues: List = []
+
         self.ground_stations = self._init_ground_stations()
         self.num_ground_stations = len(self.ground_stations)
-        
+
         # --- Dynamic State Containers ---
         self.task_queue: deque[Task] = deque()
-        self.uplink_buffer: List[Tuple[datetime, Task, int]] = []
-        self.pending_ue_tasks: deque[Tuple[UserEquipment, Task]] = deque()
         self.completed_tasks: deque[Task] = deque()
         self.current_task: Optional[Task] = None
         self.steps_taken = 0
@@ -87,23 +87,13 @@ class SatelliteEnv(gym.Env):
 
         self.observation_space = spaces.Dict({
             "task_origin_pos": spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32),
-            "task_info": spaces.Box(low=0, high=np.inf, shape=(4,), dtype=np.float32),
+            # New unified task info: [width, height, max_latency_sec, data_size_bits, required_flops]
+            "task_info": spaces.Box(low=0, high=np.inf, shape=(5,), dtype=np.float32),
             "compute_pos": spaces.Box(low=-np.inf, high=np.inf, shape=(self.num_compute_satellites, 3), dtype=np.float32),
             "compute_queues": spaces.Box(low=0, high=np.inf, shape=(self.num_compute_satellites,), dtype=np.float32),
             "ground_station_pos": spaces.Box(low=-np.inf, high=np.inf, shape=(self.num_ground_stations, 3), dtype=np.float32),
             "queue_depth": spaces.Box(low=0, high=np.inf, shape=(1,), dtype=np.float32)
         })
-
-    def _init_ues(self) -> List[UserEquipment]:
-        """Initializes a fixed set of UEs within the target area."""
-        num_ues = self.sim_config['user_equipment']['num_ues']
-        area = self.sim_config['target_area']
-        ues = []
-        for i in range(num_ues):
-            lat = self._rng.uniform(area['min_lat_deg'], area['max_lat_deg'])
-            lon = self._rng.uniform(area['min_lon_deg'], area['max_lon_deg'])
-            ues.append(UserEquipment(ue_id=i, lat_deg=lat, lon_deg=lon))
-        return ues
 
     def _init_ground_stations(self) -> List[GroundStation]:
         """Initializes ground stations based on the specified generation method."""
@@ -130,7 +120,8 @@ class SatelliteEnv(gym.Env):
             img_w, img_h = self.current_task.width, self.current_task.height
 
         stride = slice_size * (1 - overlap_ratio)
-        if stride == 0: return 1
+        if stride == 0:
+            return 1
         slices_w = math.ceil((img_w - slice_size) / stride) + 1 if img_w > slice_size else 1
         slices_h = math.ceil((img_h - slice_size) / stride) + 1 if img_h > slice_size else 1
         return slices_w * slices_h
@@ -141,7 +132,13 @@ class SatelliteEnv(gym.Env):
             return {key: np.zeros(space.shape, dtype=space.dtype) for key, space in self.observation_space.spaces.items()}
 
         task_origin_pos = self.current_task.origin.position_ecef.astype(np.float32)
-        task_info = np.array([self.current_task.width, self.current_task.height, self.current_task.bands, self.current_task.data_size_bits], dtype=np.float32)
+        task_info = np.array([
+            self.current_task.width,
+            self.current_task.height,
+            self.current_task.max_latency_sec,
+            self.current_task.data_size_bits,
+            self.current_task.required_flops,
+        ], dtype=np.float32)
         compute_pos = np.array([sat.position_ecef for sat in self.compute_satellites], dtype=np.float32)
         compute_queues = np.array([sat.queue_load_flops for sat in self.compute_satellites], dtype=np.float32)
         gs_pos = np.array([gs.position_ecef for gs in self.ground_stations], dtype=np.float32)
@@ -156,69 +153,16 @@ class SatelliteEnv(gym.Env):
             "queue_depth": queue_depth
         }
 
-    def _process_uplink_buffer(self) -> List[Task]:
-        """Check for tasks that have completed their uplink and return them."""
-        arrived_tasks = []
-        remaining_uplinks = []
-        for arrival_time, task, dest_sat_id in self.uplink_buffer:
-            if self.orbit_propagator.simulation_time >= arrival_time:
-                dest_sat = next((sat for sat in self.source_satellites if sat.id == dest_sat_id), None)
-                if dest_sat:
-                    task.origin = dest_sat
-                    arrived_tasks.append(task)
-            else:
-                remaining_uplinks.append((arrival_time, task, dest_sat_id))
-        self.uplink_buffer = remaining_uplinks
-        return arrived_tasks
-
-    def _generate_new_tasks(self) -> Tuple[List[Task], List[Task]]:
-        """Generates new RS tasks and queues a new UE task."""
-        new_rs_tasks = self.task_generator.check_and_generate_remote_sensing_tasks(self.source_satellites)
-        self.task_queue.extend(new_rs_tasks)
-
-        if self.ground_ues:
-            ue = self._rng.choice(self.ground_ues)
-            ue_task = self.task_generator.generate_ue_task(ue)
-            self.pending_ue_tasks.append((ue, ue_task))
-            return new_rs_tasks, [ue_task]
-        
-        return new_rs_tasks, []
-
-    def _process_pending_ue_tasks(self) -> List[Task]:
-        """Try to find an uplink for pending UE tasks."""
-        still_pending = deque()
-        newly_uplinking = []
-        while self.pending_ue_tasks:
-            ue, task = self.pending_ue_tasks.popleft()
-            
-            min_dist = np.inf
-            closest_sat = None
-            for sat in self.source_satellites:
-                if np.isnan(sat.position_ecef).any(): continue
-                dist = links.get_distance_km(ue.position_ecef, sat.position_ecef)
-                if dist < min_dist:
-                    min_dist = dist
-                    closest_sat = sat
-            
-            if closest_sat:
-                uplink_capacity = links.get_uplink_capacity_bps(min_dist, self.ue_uplink_frequency_ghz)
-                t_uplink = task.data_size_bits / uplink_capacity if uplink_capacity > 0 else np.inf
-                
-                if not np.isinf(t_uplink):
-                    arrival_time = self.orbit_propagator.simulation_time + timedelta(seconds=t_uplink)
-                    self.uplink_buffer.append((arrival_time, task, closest_sat.id))
-                    newly_uplinking.append(task)
-                else:
-                    still_pending.append((ue, task))
-            else:
-                still_pending.append((ue, task))
-        
-        self.pending_ue_tasks = still_pending
-        return newly_uplinking
+    def _generate_new_tasks(self) -> List[Task]:
+        """Generates new unified tasks (Poisson per satellite) up to current sim time and pushes to queue."""
+        sim_time = self.orbit_propagator.simulation_time
+        new_tasks = self.task_generator.generate_unified_tasks(self.source_satellites, sim_time)
+        self.task_queue.extend(new_tasks)
+        return new_tasks
 
     def _get_next_task(self) -> Dict[str, List]:
         """Advances simulation until a task becomes available, logging events."""
-        log = {'newly_arrived': [], 'newly_generated_rs': [], 'newly_generated_ue': [], 'newly_uplinking_ue': []}
+        log = {'newly_generated_rs': []}
         while not self.task_queue:
             if self.steps_taken >= self.max_episode_steps:
                 self.current_task = None
@@ -227,17 +171,9 @@ class SatelliteEnv(gym.Env):
             self.orbit_propagator.advance_simulation_time(60)
             self.orbit_propagator.update_satellite_positions(self.all_satellites)
             self.steps_taken += 1
-            
-            arrived = self._process_uplink_buffer()
-            self.task_queue.extend(arrived)
-            log['newly_arrived'].extend(arrived)
-            
-            new_rs, new_ue_for_pending = self._generate_new_tasks()
-            log['newly_generated_rs'].extend(new_rs)
-            log['newly_generated_ue'].extend(new_ue_for_pending)
-            
-            newly_uplinking = self._process_pending_ue_tasks()
-            log['newly_uplinking_ue'].extend(newly_uplinking)
+
+            new_tasks = self._generate_new_tasks()
+            log['newly_generated_rs'].extend(new_tasks)
 
         self.current_task = self.task_queue.popleft() if self.task_queue else None
         return log
@@ -247,35 +183,36 @@ class SatelliteEnv(gym.Env):
         self.orbit_propagator.simulation_time = self.start_time
         self.steps_taken = 0
         self.task_queue.clear()
-        self.uplink_buffer.clear()
-        self.pending_ue_tasks.clear()
         self.completed_tasks.clear()
 
         for sat in self.compute_satellites:
             sat.task_queue.clear()
             sat.queue_load_flops = 0.0
-        
+
         self.orbit_propagator.update_satellite_positions(self.all_satellites)
+        # Initialize Poisson arrivals per satellite starting from current sim time
+        self.task_generator.reset_arrivals(self.orbit_propagator.simulation_time, self.source_satellites)
         self._get_next_task()
-        
+
         return self._get_obs(), {}
 
     def _calculate_latency_and_reward(self, k: int, assignment: np.ndarray) -> Tuple[float, float]:
-        if not self.current_task: return 0.0, 0.0
+        if not self.current_task:
+            return 0.0, 0.0
 
         source_sat = self.current_task.origin
+        # Use unified task attributes
         slice_data_size_bits = self.current_task.data_size_bits / k
-        slice_flops = (self.current_task.width * self.current_task.height / k) * self.current_task.bands * self.dl_model_flops_per_pixel
-        output_bits_per_pixel = np.ceil(np.log2(self.dl_model_output_classes))
-        slice_result_size_bits = (self.current_task.width * self.current_task.height / k) * self.current_task.bands * output_bits_per_pixel
+        slice_flops = self.current_task.required_flops / k
+        # No explicit result size provided in the new model; assume negligible
+        slice_result_size_bits = 0.0
 
-        latencies = []
+        latencies: List[float] = []
         for dest_id, group in itertools.groupby(sorted(enumerate(assignment[:k]), key=lambda x: x[1]), key=lambda x: x[1]):
             num_slices_for_dest = len(list(group))
-            
-            # New logic: Check if destination is a Ground Station or a Compute Satellite
+
             if 0 <= dest_id < self.num_ground_stations:
-                # Destination is a Ground Station
+                # Destination is a Ground Station: downlink raw data then compute on GS
                 gs = self.ground_stations[dest_id]
                 dist = links.get_distance_km(source_sat.position_ecef, gs.position_ecef)
                 capacity = links.get_downlink_capacity_bps(dist, self.downlink_frequency_ghz)
@@ -292,24 +229,24 @@ class SatelliteEnv(gym.Env):
                     t_isl = (num_slices_for_dest * slice_data_size_bits) / isl_capacity if isl_capacity > 0 else np.inf
                     t_queue = target_sat.queue_load_flops / (target_sat.compute_gflops * 1e9)
                     t_comp = (num_slices_for_dest * slice_flops) / (target_sat.compute_gflops * 1e9)
-                    
                     # Add the task to the satellite's queue
                     task_flops = num_slices_for_dest * slice_flops
                     target_sat.add_task_to_queue(task_flops)
-                    
-                    dist_down = links.get_distance_km(target_sat.position_ecef, self.ground_stations[0].position_ecef) # Simplified: all results to first GS
-                    down_capacity = links.get_downlink_capacity_bps(dist_down, self.downlink_frequency_ghz)
-                    t_down = (num_slices_for_dest * slice_result_size_bits) / down_capacity if down_capacity > 0 else np.inf
+                    # Result downlink assumed negligible
+                    t_down = 0.0
                     latencies.append(t_isl + t_queue + t_comp + t_down)
 
-        total_latency_sec = max(latencies) if latencies else 0
-        accuracy_factor = 1.0 # Placeholder
-        aoi = np.exp(-constants.AOI_DECAY_RATE_LAMBDA * total_latency_sec)
-        reward = accuracy_factor * aoi
-        return total_latency_sec, float(reward)
+        total_latency_sec = max(latencies) if latencies else 0.0
+        # Enforce max latency constraint: zero reward if violated
+        if total_latency_sec > self.current_task.max_latency_sec:
+            reward = 0.0
+        else:
+            aoi = np.exp(-constants.AOI_DECAY_RATE_LAMBDA * total_latency_sec)
+            reward = float(aoi)
+        return total_latency_sec, reward
 
     def step(self, action: Dict[str, np.ndarray]) -> Tuple[Dict[str, np.ndarray], float, bool, bool, Dict[str, Any]]:
-        info = {}
+        info: Dict[str, Any] = {}
         if self.current_task:
             self.completed_tasks.append(self.current_task)
 
@@ -317,11 +254,11 @@ class SatelliteEnv(gym.Env):
             wait_log = self._get_next_task()
             obs = self._get_obs()
             truncated = self.steps_taken >= self.max_episode_steps
-            terminated = (not self.task_queue and not self.uplink_buffer) and truncated
+            terminated = (not self.task_queue) and truncated
             info.update(wait_log)
             info['info'] = 'Agent was idle, waited for next task.'
             return obs, 0.0, terminated, truncated, info
-        
+
         slice_size_idx, overlap_ratio_idx = action['slice_strategy']
         assignment = action['assignment']
         strategy = self.slicing_strategies[slice_size_idx]
@@ -330,24 +267,22 @@ class SatelliteEnv(gym.Env):
         k = self._calculate_k(slice_size, overlap_ratio)
 
         total_latency_sec, reward = self._calculate_latency_and_reward(k, assignment)
-        
+
         time_to_advance = total_latency_sec
-        if np.isinf(total_latency_sec):
-            time_to_advance = self.sim_config['task_generation']['interval_range_sec'][1]
-        
+        if np.isinf(total_latency_sec) or total_latency_sec <= 0:
+            # Advance by a default interval if infeasible or zero
+            time_to_advance = self.sim_config['task_generation'].get('interval_range_sec', [60, 300])[1]
+
         self.orbit_propagator.advance_simulation_time(time_to_advance)
         self.orbit_propagator.update_satellite_positions(self.all_satellites)
         self.steps_taken += 1
-        
-        arrived_tasks = self._process_uplink_buffer()
-        self.task_queue.extend(arrived_tasks)
-        new_rs_tasks, new_ue_tasks_for_pending = self._generate_new_tasks()
-        newly_uplinking_tasks = self._process_pending_ue_tasks()
+
+        new_tasks = self._generate_new_tasks()
 
         self._get_next_task()
 
         truncated = self.steps_taken >= self.max_episode_steps
-        terminated = (not self.task_queue and not self.uplink_buffer) and truncated
+        terminated = (not self.task_queue) and truncated
 
         obs = self._get_obs()
         info = {
@@ -355,16 +290,13 @@ class SatelliteEnv(gym.Env):
             'chosen_slice_size': slice_size,
             'chosen_overlap_ratio': overlap_ratio,
             'calculated_k': k,
-            'newly_generated_rs_tasks': new_rs_tasks,
-            'newly_generated_ue_tasks': new_ue_tasks_for_pending,
-            'newly_uplinking_ue_tasks': newly_uplinking_tasks,
-            'newly_arrived_ue_tasks': arrived_tasks
+            'newly_generated_rs_tasks': new_tasks,  # keep key name for backward compatibility
         }
-        
+
         return obs, reward, terminated, truncated, info
 
     def render(self, mode='human'):
         if mode == 'human':
             print(f"--- Sim Time: {self.orbit_propagator.simulation_time}, Step: {self.steps_taken} ---")
             print(f"Current Task: {self.current_task}")
-            print(f"Tasks in Queue: {len(self.task_queue)}, Uplinks: {len(self.uplink_buffer)}, Pending UEs: {len(self.pending_ue_tasks)}")
+            print(f"Tasks in Queue: {len(self.task_queue)}")
