@@ -51,6 +51,6 @@ user_equipment:
   uplink_frequency_ghz: 1.6 # L-band for UE to satellite uplink
   # Task generation parameters specific to UEs
   task_generation:
-    image_size_range: [512, 2048]
-    bands_range: [1, 3]
+    image_size_range: [6000, 6000]
+    bands_range: [3, 3]
     bits_per_pixel: 8
