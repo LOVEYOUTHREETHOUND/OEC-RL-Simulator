@@ -32,35 +32,48 @@ FSPL_BASE_LOSS_DB = 92.45
 # --- Satellite-to-Ground Link (Downlink) Constants ---
 
 # Environmental attenuation loss in dB. Assumed constant as per the spec.
-DOWNLINK_ENV_LOSS_DB = 10.0  # Placeholder value, can be tuned
+DOWNLINK_ENV_LOSS_DB = 8.0  # Slightly reduced to improve availability
 
 # Rician factor for the small-scale fading model
-DOWNLINK_RICIAN_FACTOR_K = 12.0  # Placeholder value, represents a strong LoS component
+DOWNLINK_RICIAN_FACTOR_K = 12.0  # Strong LoS component
 
 # Minimum Carrier-to-Noise Ratio (CNR) threshold for successful demodulation in dB
-DOWNLINK_CNR_THRESHOLD_DB = 5.0 # Placeholder value
+# Note: The link model will no longer hard-zero capacity below this; instead we use soft floors.
+DOWNLINK_CNR_THRESHOLD_DB = 0.0
 
 # --- Inter-Satellite Link (ISL) Constants ---
 
-# Transmitter power in Watts (W)
-ISL_TRANSMITTER_POWER_W = 0.5 # Placeholder value
+# Transmitter power in Watts (W) - increased to make long ISL more feasible
+ISL_TRANSMITTER_POWER_W = 5.0
 
 # Antenna 3dB beamwidth for both theta and phi axes in degrees
 ISL_ANTENNA_3DB_BEAMWIDTH_DEG = 10.0
 
-# Effective aperture of the antenna in square meters (m^2). Original 0.2 cm^2.
-ISL_ANTENNA_EFFECTIVE_APERTURE_M2 = 0.2 / (100**2)
+# Effective aperture of the antenna in square meters (m^2).
+# Previously 0.2 cm^2 (~0.00002 m^2) was unrealistically small; increase to 0.01 m^2.
+ISL_ANTENNA_EFFECTIVE_APERTURE_M2 = 0.01
 
-# Standard deviation of the pointing error in radians
-ISL_POINTING_ERROR_STD_DEV_RAD = 0.05
+# Standard deviation of the pointing error in radians (reduced for stability)
+ISL_POINTING_ERROR_STD_DEV_RAD = 0.01
 
 # System noise temperature components in Kelvin (K)
-ISL_NOISE_TEMP_RECEIVER_K = 1000.0  # T0: Receiver electronics noise
+ISL_NOISE_TEMP_RECEIVER_K = 500.0   # Reduced receiver noise temperature
 ISL_NOISE_TEMP_SPACE_K = 6000.0     # Ts: Noise from surrounding space objects
-ISL_NOISE_TEMP_CMB_K = 2.73        # T_cmb: Cosmic Microwave Background
+ISL_NOISE_TEMP_CMB_K = 2.73         # T_cmb: Cosmic Microwave Background
 
 # Bandwidth as a percentage of the carrier frequency
 ISL_BANDWIDTH_TO_FREQUENCY_RATIO = 0.02
+
+# --- Link modeling stabilizers for RL ---
+# Toggle small-scale/random effects to stabilize learning
+LINKS_USE_RANDOM_POINTING = False
+LINKS_USE_RICIAN_FADING = False
+
+# Capacity/SNR floors to avoid infinite latencies
+MIN_ISL_SNR_DB = -10.0
+MIN_DOWNLINK_CNR_DB = -10.0
+MIN_ISL_CAPACITY_BPS = 1e5           # 100 kbps floor
+MIN_DOWNLINK_CAPACITY_BPS = 1e5      # 100 kbps floor
 
 
 # III. Information Value (VoI) Constants

@@ -17,7 +17,14 @@ if project_root not in sys.path:
 
 from src.environment.satellite_env import SatelliteEnv
 # from src.agents.hrl_agent import HierarchicalAgent # Keep for future use
-from src.agents.baselines import RandomPolicy, GreedyPolicy, BasePolicy
+from src.agents.baselines import (
+    RandomPolicy,
+    GreedyMinQueuePolicy,
+    RoundRobinPolicy,
+    GroundOnlyPolicy,
+    ComputeOnlyMinQueuePolicy,
+    BasePolicy,
+)
 
 def load_config(path):
     """Loads a YAML configuration file."""
@@ -60,20 +67,25 @@ def main():
 
     # --- 1. Load Configurations ---
     print("\n[1/3] Loading configurations...")
-    sim_config = load_config(os.path.join(project_root, 'configs/environment/simulation_v1.yaml'))
-    sat_configs = load_config(os.path.join(project_root, 'configs/satellites.yaml'))
+    sim_config = load_config(os.path.join(project_root, 'configs/environment/simulation.yaml'))
+    raw_sat_configs = load_config(os.path.join(project_root, 'configs/satellites.yaml'))
     # agent_config = load_config(os.path.join(project_root, 'configs/agent/hrl_agent.yaml'))
 
     # --- 2. Initialize Environment ---
     print("\n[2/3] Initializing the environment...")
+    from src.utils.tle_loader import preprocess_satellite_configs
+    sat_configs = preprocess_satellite_configs(project_root, raw_sat_configs)
     env = SatelliteEnv(sim_config=sim_config, sat_configs=sat_configs)
 
     # --- 3. Evaluate Policies ---
     print(f"\n[3/3] Evaluating policies for {n_eval_episodes} episodes...")
     policies_to_evaluate = {
         'Random': RandomPolicy(env),
-        'Greedy': GreedyPolicy(env),
-        # 'HRL_Agent': HierarchicalAgent(env, config=agent_config) # TODO: Uncomment when HRL agent is trainable
+        'GreedyMinQueue': GreedyMinQueuePolicy(env),
+        'RoundRobin': RoundRobinPolicy(env),
+        'GroundOnly': GroundOnlyPolicy(env),
+        'ComputeOnlyMinQueue': ComputeOnlyMinQueuePolicy(env),
+        # 'HRL_Agent': HierarchicalAgent(env, config=agent_config)
     }
 
     results = {}

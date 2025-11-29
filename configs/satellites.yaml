@@ -64,33 +64,34 @@ compute_satellites:
 
 # --- MEO Leader Satellites (Task Planners) ---
 # Stronger coverage: select 24 Galileo MEO satellites, balanced across three RAAN clusters (~106°, ~227°, ~347°)
+# MEO satellites can also compute with the same capacity as LEO satellites
 leader_satellites:
   # Plane ~347° RAAN
-  - { sat_id: 37846, name: "GSAT0101 (GALILEO-PFM)" }
-  - { sat_id: 37847, name: "GSAT0102 (GALILEO-FM2)" }
-  - { sat_id: 43564, name: "GSAT0221 (GALILEO 25)" }
-  - { sat_id: 43565, name: "GSAT0222 (GALILEO 26)" }
-  - { sat_id: 43566, name: "GSAT0219 (GALILEO 23)" }
-  - { sat_id: 43567, name: "GSAT0220 (GALILEO 24)" }
-  - { sat_id: 49809, name: "GSAT0223 (GALILEO 27)" }
-  - { sat_id: 49810, name: "GSAT0224 (GALILEO 28)" }
+  - { sat_id: 37846, name: "GSAT0101 (GALILEO-PFM)", compute_gflops: 150.0 }
+  - { sat_id: 37847, name: "GSAT0102 (GALILEO-FM2)", compute_gflops: 150.0 }
+  - { sat_id: 43564, name: "GSAT0221 (GALILEO 25)", compute_gflops: 150.0 }
+  - { sat_id: 43565, name: "GSAT0222 (GALILEO 26)", compute_gflops: 150.0 }
+  - { sat_id: 43566, name: "GSAT0219 (GALILEO 23)", compute_gflops: 150.0 }
+  - { sat_id: 43567, name: "GSAT0220 (GALILEO 24)", compute_gflops: 150.0 }
+  - { sat_id: 49809, name: "GSAT0223 (GALILEO 27)", compute_gflops: 150.0 }
+  - { sat_id: 49810, name: "GSAT0224 (GALILEO 28)", compute_gflops: 150.0 }
 
   # Plane ~227° RAAN
-  - { sat_id: 40889, name: "GSAT0205 (GALILEO 9)" }
-  - { sat_id: 40890, name: "GSAT0206 (GALILEO 10)" }
-  - { sat_id: 41549, name: "GSAT0211 (GALILEO 14)" }
-  - { sat_id: 41550, name: "GSAT0210 (GALILEO 13)" }
-  - { sat_id: 43055, name: "GSAT0215 (GALILEO 19)" }
-  - { sat_id: 43056, name: "GSAT0216 (GALILEO 20)" }
-  - { sat_id: 43057, name: "GSAT0217 (GALILEO 21)" }
-  - { sat_id: 43058, name: "GSAT0218 (GALILEO 22)" }
+  - { sat_id: 40889, name: "GSAT0205 (GALILEO 9)", compute_gflops: 150.0 }
+  - { sat_id: 40890, name: "GSAT0206 (GALILEO 10)", compute_gflops: 150.0 }
+  - { sat_id: 41549, name: "GSAT0211 (GALILEO 14)", compute_gflops: 150.0 }
+  - { sat_id: 41550, name: "GSAT0210 (GALILEO 13)", compute_gflops: 150.0 }
+  - { sat_id: 43055, name: "GSAT0215 (GALILEO 19)", compute_gflops: 150.0 }
+  - { sat_id: 43056, name: "GSAT0216 (GALILEO 20)", compute_gflops: 150.0 }
+  - { sat_id: 43057, name: "GSAT0217 (GALILEO 21)", compute_gflops: 150.0 }
+  - { sat_id: 43058, name: "GSAT0218 (GALILEO 22)", compute_gflops: 150.0 }
 
   # Plane ~106–107° RAAN
-  - { sat_id: 38857, name: "GSAT0103 (GALILEO-FM3)" }
-  - { sat_id: 41174, name: "GSAT0209 (GALILEO 12)" }
-  - { sat_id: 41175, name: "GSAT0208 (GALILEO 11)" }
-  - { sat_id: 41859, name: "GSAT0207 (GALILEO 15)" }
-  - { sat_id: 41860, name: "GSAT0212 (GALILEO 16)" }
-  - { sat_id: 41861, name: "GSAT0213 (GALILEO 17)" }
-  - { sat_id: 41862, name: "GSAT0214 (GALILEO 18)" }
-  - { sat_id: 59600, name: "GSAT0227 (GALILEO 30)" }
+  - { sat_id: 38857, name: "GSAT0103 (GALILEO-FM3)", compute_gflops: 150.0 }
+  - { sat_id: 41174, name: "GSAT0209 (GALILEO 12)", compute_gflops: 150.0 }
+  - { sat_id: 41175, name: "GSAT0208 (GALILEO 11)", compute_gflops: 150.0 }
+  - { sat_id: 41859, name: "GSAT0207 (GALILEO 15)", compute_gflops: 150.0 }
+  - { sat_id: 41860, name: "GSAT0212 (GALILEO 16)", compute_gflops: 150.0 }
+  - { sat_id: 41861, name: "GSAT0213 (GALILEO 17)", compute_gflops: 150.0 }
+  - { sat_id: 41862, name: "GSAT0214 (GALILEO 18)", compute_gflops: 150.0 }
+  - { sat_id: 59600, name: "GSAT0227 (GALILEO 30)", compute_gflops: 150.0 }

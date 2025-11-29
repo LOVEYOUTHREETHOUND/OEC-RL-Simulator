@@ -39,12 +39,30 @@ def parse_args():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--run_name", type=str, default=None)
     p.add_argument("--use_subproc", action="store_true")
+    # Fast/clear-convergence knobs
+    p.add_argument("--n_steps", type=int, default=4096)
+    p.add_argument("--batch_size", type=int, default=2048)
+    p.add_argument("--n_epochs", type=int, default=10)
+    p.add_argument("--learning_rate", type=float, default=3e-4)
+    p.add_argument("--ent_coef", type=float, default=0.01)
+    p.add_argument("--override_max_tasks_per_episode", type=int, default=None)
+    p.add_argument("--fast_preset", action="store_true", help="Use faster/more responsive settings for clearer convergence curves")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
     set_random_seed(args.seed)
+
+    # Apply fast preset if requested
+    if args.fast_preset:
+        args.n_steps = 1024
+        args.n_epochs = 5
+        args.learning_rate = 1e-4
+        args.ent_coef = 0.005
+        args.batch_size = 3072
+        if args.override_max_tasks_per_episode is None:
+            args.override_max_tasks_per_episode = 30
 
     # Prepare run directories
     paths = prepare_run_dirs(algo="ppo", run_name=args.run_name)
@@ -59,6 +77,15 @@ def main():
         "models_dir": paths["models"],
         "monitor_dir": paths["monitor"],
         "evals_dir": paths["evals"],
+        "hyperparams": {
+            "n_steps": args.n_steps,
+            "batch_size": args.batch_size,
+            "n_epochs": args.n_epochs,
+            "learning_rate": args.learning_rate,
+            "ent_coef": args.ent_coef,
+            "override_max_tasks_per_episode": args.override_max_tasks_per_episode,
+            "fast_preset": bool(args.fast_preset),
+        }
     })
 
     # Build training and evaluation envs
@@ -70,29 +97,33 @@ def main():
         use_subproc=args.use_subproc,
         use_action_wrapper=True,
         monitor_log_dir=paths["monitor"],
+        override_max_tasks_per_episode=args.override_max_tasks_per_episode,
     )
+    # Make eval env type consistent with train env to avoid warnings
+    eval_env_n = args.n_envs if (args.use_subproc and args.n_envs > 1) else 1
     eval_env = make_vec_envs(
         sim_config_path=args.sim_config,
         sats_config_path=args.sats_config,
-        n_envs=1,
+        n_envs=eval_env_n,
         seed=args.seed + 10_000,
-        use_subproc=False,
+        use_subproc=args.use_subproc,
         use_action_wrapper=True,
         monitor_log_dir=None,
+        override_max_tasks_per_episode=args.override_max_tasks_per_episode,
     )
 
     # Model
     model = PPO(
         policy="MultiInputPolicy",
         env=train_env,
-        learning_rate=3e-4,
-        n_steps=4096,
-        batch_size=2048,
-        n_epochs=10,
+        learning_rate=args.learning_rate,
+        n_steps=args.n_steps,
+        batch_size=args.batch_size,
+        n_epochs=args.n_epochs,
         gamma=0.99,
         gae_lambda=0.95,
         clip_range=0.2,
-        ent_coef=0.01,
+        ent_coef=args.ent_coef,
         vf_coef=0.5,
         max_grad_norm=0.5,
         seed=args.seed,
@@ -102,14 +133,33 @@ def main():
     )
 
     # Callbacks
+    info_keys = [
+        "total_latency",
+        "miou",
+        "aoi",
+        "violation_ratio",
+        "feasible",
+        "chosen_slice_size",
+        "chosen_overlap_ratio",
+        "calculated_k",
+    ]
     callbacks = build_callbacks(eval_env=eval_env,
                                 models_dir=paths["models"],
                                 evals_dir=paths["evals"],
                                 best_model_name="best_model",
-                                save_freq_steps=100_000)
+                                save_freq_steps=100_000,
+                                info_keys=info_keys,
+                                info_log_every=1000)
 
     # Train
     model.learn(total_timesteps=args.total_timesteps, callback=callbacks, progress_bar=True)
+
+    # Ensure TensorBoard logs are flushed to disk
+    try:
+        if hasattr(model, "logger"):
+            model.logger.dump(model.num_timesteps)
+    except Exception:
+        pass
 
     # Final save
     model.save(os.path.join(paths["models"], "final_model"))

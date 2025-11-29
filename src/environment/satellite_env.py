@@ -1,13 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-This module defines the main reinforcement learning environment, SatelliteEnv,
-updated to a unified-task setting: there is only one type of task, which is
-assumed to already be available on a source (remote-sensing) satellite when it
-is over the target area. We do not model UE-originated tasks or uplinks anymore.
+Refactored SatelliteEnv for single source satellite training.
+
+Key changes:
+1. Each episode focuses on ONE randomly selected source satellite
+2. Only the nearest visible MEO leader satellite is selected per task
+3. Observation includes only the 10 nearest compute satellites + nearest ground station
+4. Task queues are tracked globally for all compute nodes (LEO + MEO + GS)
+5. Episode terminates after a fixed number of tasks (decisions)
+6. Invalid steps (no visible MEO/compute satellites) are skipped without reward/penalty
 """
 
-from typing import Dict, Any, List, Tuple, Optional
-from datetime import datetime
+from typing import Dict, Any, List, Tuple, Optional, Callable
+from datetime import datetime, timedelta
 from collections import deque
 import itertools
 import math
@@ -16,16 +21,77 @@ import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 
+import os
 from src.environment.components.satellite import Satellite
 from src.environment.components.ground_station import GroundStation
+from src.environment.components.compute_node import (
+    ComputeNode, reset_compute_node_registry, get_all_compute_nodes
+)
 from src.environment.components.task_generator import Task, TaskGenerator
 from src.physics.orbits import OrbitPropagator
 from src.physics import links, constants
 from src.utils.geo import generate_hex_grid_centers
+from src.utils.tle_loader import preprocess_satellite_configs
 
 
 class SatelliteEnv(gym.Env):
-    """Custom Environment for Satellite Edge Computing Simulation with unified task generation."""
+    # ---------- Helper: mIoU surrogate & table ----------
+    def _miou_surrogate(self, slice_size: int, overlap_ratio: float) -> float:
+        # Monotone, saturating functions
+        sp = self.surrogate_params or {}
+        s0 = float(sp.get('s0', 1024.0))
+        alpha = float(sp.get('alpha', 1.0))
+        tau = float(sp.get('tau', 0.2))
+        beta = float(sp.get('beta', 1.0))
+        w_size = float(sp.get('w_size', 0.7))
+        w_ov = float(sp.get('w_overlap', 0.3))
+        # Normalize slice_size relative to s0
+        f_size = 1.0 - np.exp(- (slice_size / max(s0, 1e-6)) ** alpha)
+        f_ov = 1.0 - np.exp(- (overlap_ratio / max(tau, 1e-6)) ** beta)
+        xm_norm = (w_size * f_size + w_ov * f_ov) / max(w_size + w_ov, 1e-6)
+        xm_norm = float(np.clip(xm_norm, 0.0, 1.0))
+        # Scale and gamma
+        xm_scaled = self.scale_min + (self.scale_max - self.scale_min) * (xm_norm ** self.gamma_miou)
+        return float(np.clip(xm_scaled, 0.0, 1.0))
+
+    def _miou_from_table(self, slice_size: int, overlap_ratio: float) -> float:
+        if not self.miou_table or not self.miou_overlaps:
+            return self._miou_surrogate(slice_size, overlap_ratio)
+        # Find nearest slice_size key
+        sizes = [s['slice_size'] for s in self.slicing_strategies]
+        nearest_size = min(sizes, key=lambda s: abs(s - slice_size))
+        key = str(nearest_size)
+        arr = self.miou_table.get(key)
+        if not arr:
+            return self._miou_surrogate(slice_size, overlap_ratio)
+        # Linear interp over overlaps
+        xs = np.array(self.miou_overlaps, dtype=float)
+        ys = np.array(arr, dtype=float)
+        ov = float(np.clip(overlap_ratio, float(xs.min()), float(xs.max())))
+        miou_raw = float(np.interp(ov, xs, ys))
+        # Normalize and scale
+        if self.miou_norm_range and len(self.miou_norm_range) == 2:
+            mn, mx = float(self.miou_norm_range[0]), float(self.miou_norm_range[1])
+        else:
+            mn = self._miou_min if self._miou_min is not None else float(ys.min())
+            mx = self._miou_max if self._miou_max is not None else float(ys.max())
+        if mx <= mn:  # fallback
+            xm = self._miou_surrogate(slice_size, overlap_ratio)
+            return xm
+        miou_norm = (miou_raw - mn) / (mx - mn)
+        miou_norm = float(np.clip(miou_norm, 0.0, 1.0))
+        xm_scaled = self.scale_min + (self.scale_max - self.scale_min) * (miou_norm ** self.gamma_miou)
+        return float(np.clip(xm_scaled, 0.0, 1.0))
+
+    """
+    Refactored environment for single-source satellite RL training.
+    
+    Each episode:
+    - Randomly selects one source satellite for task generation
+    - Selects the nearest visible MEO leader per task
+    - Observes only the 10 nearest compute satellites + nearest ground station
+    - Terminates after a fixed number of task decisions
+    """
     metadata = {'render_modes': ['human']}
 
     def __init__(self, sim_config: Dict[str, Any], sat_configs: Dict[str, List[Dict[str, Any]]]):
@@ -39,11 +105,18 @@ class SatelliteEnv(gym.Env):
         self.isl_frequency_ghz = sim_config['isl_frequency_ghz']
         self.downlink_frequency_ghz = sim_config['downlink_frequency_ghz']
         self.slicing_strategies = sim_config.get('slicing_strategies', [])
-        self.max_episode_steps = sim_config.get('max_episode_steps', 500)
+        
+        # Episode termination: number of tasks to process per episode
+        self.max_tasks_per_episode = sim_config.get('max_tasks_per_episode', 100)
+        
+        # Observation parameters
+        self.num_nearest_compute = sim_config.get('num_nearest_compute_satellites', 10)
+        self.isl_visibility_range_km = sim_config.get('isl_visibility_range_km', 5000.0)
 
         # --- Initialize Environment Components ---
         self.orbit_propagator = OrbitPropagator(self.start_time)
-        # TaskGenerator now unified; derive required FLOPs using flops_per_pixel
+        
+        # TaskGenerator for unified tasks
         flops_per_pixel = float(sim_config.get('dl_model', {}).get('flops_per_pixel', 1000.0))
         self.task_generator = TaskGenerator(
             task_config=sim_config['task_generation'],
@@ -51,39 +124,134 @@ class SatelliteEnv(gym.Env):
             flops_per_pixel=flops_per_pixel,
         )
 
-        self.source_satellites = [Satellite(sat_id=cfg['sat_id'], config=cfg) for cfg in sat_configs['source_satellites']]
-        self.compute_satellites = [Satellite(sat_id=cfg['sat_id'], config=cfg) for cfg in sat_configs['compute_satellites']]
-        # Optional MEO leader satellites
-        self.leader_satellites = [Satellite(sat_id=cfg['sat_id'], config=cfg) for cfg in sat_configs.get('leader_satellites', [])]
+        # Ensure TLEs are present; if not, preprocess configs to inject TLEs from cache/remote
+        def _needs_tle(cfgs: List[Dict[str, Any]]) -> bool:
+            return any('tle' not in c or not c.get('tle') for c in (cfgs or []))
+        if (_needs_tle(sat_configs.get('source_satellites', [])) or
+            _needs_tle(sat_configs.get('compute_satellites', [])) or
+            _needs_tle(sat_configs.get('leader_satellites', []))):
+            try:
+                project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+                sat_configs = preprocess_satellite_configs(project_root, sat_configs)
+            except Exception:
+                pass
+
+        # Initialize satellites
+        self.source_satellites = [Satellite(sat_id=cfg['sat_id'], config=cfg) 
+                                 for cfg in sat_configs.get('source_satellites', [])]
+        self.compute_satellites = [Satellite(sat_id=cfg['sat_id'], config=cfg) 
+                                  for cfg in sat_configs.get('compute_satellites', [])]
+        self.leader_satellites = [Satellite(sat_id=cfg['sat_id'], config=cfg) 
+                                 for cfg in sat_configs.get('leader_satellites', [])]
+        
+        self.all_satellites = self.source_satellites + self.compute_satellites + self.leader_satellites
+        self.num_source_satellites = len(self.source_satellites)
+        self.num_compute_satellites = len(self.compute_satellites)
         self.num_leader_satellites = len(self.leader_satellites)
 
-        self.all_satellites = self.source_satellites + self.compute_satellites + self.leader_satellites
-        self.num_compute_satellites = len(self.compute_satellites)
-
-        # There are no UEs anymore; keep attribute for compatibility with scripts
-        self.ground_ues: List = []
-
+        # Initialize ground stations
         self.ground_stations = self._init_ground_stations()
         self.num_ground_stations = len(self.ground_stations)
 
-        # --- Dynamic State Containers ---
+        # --- Initialize Compute Node Registry ---
+        reset_compute_node_registry()
+        self._init_compute_nodes()
+
+        # --- Episode State ---
+        self.current_source_satellite: Optional[Satellite] = None
+        self.current_leader_satellite: Optional[ComputeNode] = None
+        self.current_task: Optional[Task] = None
         self.task_queue: deque[Task] = deque()
         self.completed_tasks: deque[Task] = deque()
-        self.current_task: Optional[Task] = None
-        self.steps_taken = 0
+        
+        # Episode tracking
+        self.tasks_processed = 0  # Number of tasks processed in this episode
+        self.steps_taken = 0  # Total steps (including invalid steps)
+        self.valid_steps_taken = 0  # Valid steps only
+
+        # Debug / diagnostics
+        self.debug_latency: bool = bool(sim_config.get('debug_latency', True))
+        self._last_latency_debug: Optional[Dict[str, Any]] = None
+
+        # --- Model performance / reward config ---
+        self.performance_cfg: Dict[str, Any] = sim_config.get('model_performance', {})
+        self.reward_mode: str = str(self.performance_cfg.get('reward_mode', 'miou_soft_penalty'))
+        self.use_monotone_surrogate: bool = bool(self.performance_cfg.get('use_monotone_surrogate', True))
+        self.penalty_lambda: float = float(self.performance_cfg.get('penalty_lambda', 1.0))
+        self.voi_beta: float = float(self.performance_cfg.get('beta', 0.7))
+        self.epsilon_latency_bonus: float = float(self.performance_cfg.get('epsilon_latency_bonus', 0.0))
+        self.miou_overlaps: List[float] = self.performance_cfg.get('overlaps', [])
+        self.miou_table: Dict[str, List[float]] = self.performance_cfg.get('miou_table', {})
+        self.miou_norm_range: List[float] = self.performance_cfg.get('normalize', [])
+        self.surrogate_params: Dict[str, Any] = self.performance_cfg.get('surrogate', {})
+        self.scale_min: float = float(self.surrogate_params.get('scale', [0.8, 1.0])[0] if self.surrogate_params.get('scale') else 0.8)
+        self.scale_max: float = float(self.surrogate_params.get('scale', [0.8, 1.0])[1] if self.surrogate_params.get('scale') else 1.0)
+        self.gamma_miou: float = float(self.surrogate_params.get('gamma', 1.0))
+
+        # Precompute table min/max if provided
+        self._miou_min: Optional[float] = None
+        self._miou_max: Optional[float] = None
+        if self.miou_table:
+            vals = [v for arr in self.miou_table.values() for v in arr]
+            if vals:
+                self._miou_min = float(min(vals))
+                self._miou_max = float(max(vals))
 
         # --- Define Action and Observation Spaces ---
         self._define_spaces()
 
+    def _init_compute_nodes(self):
+        """Initialize compute nodes for all LEO satellites, MEO satellites, and ground stations."""
+        # LEO compute satellites
+        for sat in self.compute_satellites:
+            node = ComputeNode(
+                node_type="LEO",
+                node_id=sat.id,
+                compute_gflops=sat.compute_gflops,
+                position_ecef=sat.position_ecef,
+                name=sat.name
+            )
+        
+        # MEO leader satellites (can also compute)
+        for sat in self.leader_satellites:
+            node = ComputeNode(
+                node_type="MEO",
+                node_id=sat.id,
+                compute_gflops=sat.compute_gflops,
+                position_ecef=sat.position_ecef,
+                name=sat.name
+            )
+        
+        # Ground stations
+        for gs in self.ground_stations:
+            node = ComputeNode(
+                node_type="GROUND_STATION",
+                node_id=gs.id,
+                compute_gflops=gs.compute_gflops,
+                position_ecef=gs.position_ecef,
+                name=gs.name
+            )
+
     def _define_spaces(self):
-        """Defines the action and observation spaces for the environment."""
+        """Define action and observation spaces."""
         num_slice_sizes = len(self.slicing_strategies)
         num_overlap_ratios = len(self.slicing_strategies[0]['overlap_ratios']) if num_slice_sizes > 0 else 0
 
-        min_slice_size = self.slicing_strategies[0]['slice_size'] if num_slice_sizes > 0 else 512
-        max_k = self._calculate_k(min_slice_size, 0.0)
+        # Use the smallest slice size and the largest overlap to estimate the worst-case k
+        if num_slice_sizes > 0:
+            min_slice_size = min(s['slice_size'] for s in self.slicing_strategies)
+            all_overlaps = []
+            for s in self.slicing_strategies:
+                all_overlaps.extend(s.get('overlap_ratios', []))
+            max_overlap = max(all_overlaps) if all_overlaps else 0.0
+        else:
+            min_slice_size = 512
+            max_overlap = 0.0
+        max_k = self._calculate_k(min_slice_size, max_overlap)
 
-        num_destinations = self.num_ground_stations + self.num_compute_satellites
+        # Destinations: num_nearest_compute satellites + 1 ground station
+        num_destinations = self.num_nearest_compute + 1
+        
         self.action_space = spaces.Dict({
             'slice_strategy': spaces.MultiDiscrete([num_slice_sizes, num_overlap_ratios]),
             'assignment': spaces.MultiDiscrete([num_destinations] * max_k)
@@ -91,16 +259,16 @@ class SatelliteEnv(gym.Env):
 
         self.observation_space = spaces.Dict({
             "task_origin_pos": spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32),
-            # New unified task info: [width, height, max_latency_sec, data_size_bits, required_flops]
             "task_info": spaces.Box(low=0, high=np.inf, shape=(5,), dtype=np.float32),
-            "compute_pos": spaces.Box(low=-np.inf, high=np.inf, shape=(self.num_compute_satellites, 3), dtype=np.float32),
-            "compute_queues": spaces.Box(low=0, high=np.inf, shape=(self.num_compute_satellites,), dtype=np.float32),
-            "ground_station_pos": spaces.Box(low=-np.inf, high=np.inf, shape=(self.num_ground_stations, 3), dtype=np.float32),
-            "queue_depth": spaces.Box(low=0, high=np.inf, shape=(1,), dtype=np.float32)
+            "leader_pos": spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32),
+            "compute_pos": spaces.Box(low=-np.inf, high=np.inf, shape=(self.num_nearest_compute, 3), dtype=np.float32),
+            "compute_queues": spaces.Box(low=0, high=np.inf, shape=(self.num_nearest_compute,), dtype=np.float32),
+            "ground_station_pos": spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32),
+            "ground_station_queue": spaces.Box(low=0, high=np.inf, shape=(1,), dtype=np.float32),
         })
 
     def _init_ground_stations(self) -> List[GroundStation]:
-        """Initializes ground stations based on the specified generation method."""
+        """Initialize ground stations based on configuration."""
         gs_config = self.sim_config['ground_station']
         if gs_config.get('generation_method') == 'hex_grid':
             area = self.sim_config['target_area']
@@ -110,13 +278,13 @@ class SatelliteEnv(gym.Env):
                 area['min_lat_deg'], area['max_lat_deg'],
                 radius_km
             )
-            return [GroundStation(gs_id=i, lat_deg=lat, lon_deg=lon, config=gs_config) for i, (lat, lon) in enumerate(centers)]
+            return [GroundStation(gs_id=i, lat_deg=lat, lon_deg=lon, config=gs_config) 
+                   for i, (lat, lon) in enumerate(centers)]
         else:
-            # Fallback to a single, manually defined ground station if method is not hex_grid
             return [GroundStation(gs_id=0, lat_deg=0, lon_deg=0, config=gs_config)]
 
     def _calculate_k(self, slice_size: int, overlap_ratio: float) -> int:
-        """Helper to calculate number of slices based on task properties."""
+        """Calculate number of slices based on task properties."""
         if not self.current_task:
             max_size = self.sim_config['task_generation']['image_size_range'][1]
             img_w, img_h = max_size, max_size
@@ -130,10 +298,82 @@ class SatelliteEnv(gym.Env):
         slices_h = math.ceil((img_h - slice_size) / stride) + 1 if img_h > slice_size else 1
         return slices_w * slices_h
 
+    def _find_nearest_visible_leader(self, source_sat: Satellite) -> Optional[ComputeNode]:
+        """
+        Find the nearest MEO leader satellite that is visible (within ISL range).
+        
+        Returns:
+            ComputeNode wrapping the MEO satellite, or None if no visible leader exists.
+        """
+        if self.num_leader_satellites == 0:
+            return None
+        
+        source_pos = source_sat.position_ecef
+        min_distance = float('inf')
+        nearest_leader = None
+        
+        for leader_sat in self.leader_satellites:
+            distance = links.get_distance_km(source_pos, leader_sat.position_ecef)
+            
+            # Check if within visibility range
+            if distance <= self.isl_visibility_range_km and distance < min_distance:
+                min_distance = distance
+                nearest_leader = leader_sat
+        
+        if nearest_leader is None:
+            return None
+        
+        # Find the corresponding ComputeNode
+        all_nodes = get_all_compute_nodes()
+        for node in all_nodes:
+            if node.node_type == "MEO" and node.node_id == nearest_leader.id:
+                return node
+        
+        return None
+
+    def _find_nearest_compute_satellites(self, leader_pos: np.ndarray, 
+                                        num_nearest: int) -> List[ComputeNode]:
+        """
+        Find the num_nearest compute satellites closest to the leader.
+        Includes both LEO and MEO satellites (the leader itself can be selected as a compute node).
+        
+        Returns:
+            List of ComputeNode objects (LEO and MEO)
+        """
+        all_nodes = get_all_compute_nodes()
+        compute_nodes = [n for n in all_nodes if n.node_type in ["LEO", "MEO"]]
+        
+        # Sort by distance to leader (leader will have distance ~0 and thus be included)
+        distances = [(node, links.get_distance_km(leader_pos, node.position_ecef)) 
+                    for node in compute_nodes]
+        distances.sort(key=lambda x: x[1])
+        
+        # Return the nearest num_nearest satellites
+        return [node for node, _ in distances[:num_nearest]]
+
+    def _find_nearest_ground_station(self, leader_pos: np.ndarray) -> Optional[ComputeNode]:
+        """Find the nearest ground station to the leader."""
+        all_nodes = get_all_compute_nodes()
+        gs_nodes = [n for n in all_nodes if n.node_type == "GROUND_STATION"]
+        
+        if not gs_nodes:
+            return None
+        
+        distances = [(node, links.get_distance_km(leader_pos, node.position_ecef)) 
+                    for node in gs_nodes]
+        distances.sort(key=lambda x: x[1])
+        
+        return distances[0][0]
+
     def _get_obs(self) -> Dict[str, np.ndarray]:
-        """Constructs the observation dictionary from the current environment state."""
+        """Construct observation from current state."""
         if not self.current_task:
-            return {key: np.zeros(space.shape, dtype=space.dtype) for key, space in self.observation_space.spaces.items()}
+            return {key: np.zeros(space.shape, dtype=space.dtype) 
+                   for key, space in self.observation_space.spaces.items()}
+
+        # If leader not chosen yet (e.g., right after reset), try to find it now
+        if not self.current_leader_satellite:
+            self.current_leader_satellite = self._find_nearest_visible_leader(self.current_source_satellite)
 
         task_origin_pos = self.current_task.origin.position_ecef.astype(np.float32)
         task_info = np.array([
@@ -143,139 +383,332 @@ class SatelliteEnv(gym.Env):
             self.current_task.data_size_bits,
             self.current_task.required_flops,
         ], dtype=np.float32)
-        compute_pos = np.array([sat.position_ecef for sat in self.compute_satellites], dtype=np.float32)
-        compute_queues = np.array([sat.queue_load_flops for sat in self.compute_satellites], dtype=np.float32)
-        gs_pos = np.array([gs.position_ecef for gs in self.ground_stations], dtype=np.float32)
-        queue_depth = np.array([len(self.task_queue)], dtype=np.float32)
+        
+        # Leader position (may be zeros if leader not found yet)
+        leader_pos = (self.current_leader_satellite.position_ecef.astype(np.float32)
+                      if self.current_leader_satellite else np.zeros(3, dtype=np.float32))
+        
+        # Get nearest compute satellites
+        if self.current_leader_satellite is not None:
+            nearest_compute = self._find_nearest_compute_satellites(
+                self.current_leader_satellite.position_ecef, 
+                self.num_nearest_compute
+            )
+        else:
+            nearest_compute = []
+        
+        # Pad with zeros if fewer than num_nearest_compute available
+        compute_pos_list = [node.position_ecef for node in nearest_compute]
+        while len(compute_pos_list) < self.num_nearest_compute:
+            compute_pos_list.append(np.zeros(3))
+        compute_pos = np.array(compute_pos_list, dtype=np.float32)
+        
+        compute_queues = np.array([node.get_queue_load_flops() for node in nearest_compute] + 
+                                 [0.0] * (self.num_nearest_compute - len(nearest_compute)), 
+                                 dtype=np.float32)
+        
+        # Get nearest ground station
+        if self.current_leader_satellite is not None:
+            nearest_gs = self._find_nearest_ground_station(self.current_leader_satellite.position_ecef)
+        else:
+            nearest_gs = None
+        gs_pos = nearest_gs.position_ecef.astype(np.float32) if nearest_gs else np.zeros(3, dtype=np.float32)
+        gs_queue = np.array([nearest_gs.get_queue_load_flops()], dtype=np.float32) if nearest_gs else np.array([0.0], dtype=np.float32)
 
         return {
             "task_origin_pos": task_origin_pos,
             "task_info": task_info,
+            "leader_pos": leader_pos,
             "compute_pos": compute_pos,
             "compute_queues": compute_queues,
             "ground_station_pos": gs_pos,
-            "queue_depth": queue_depth
+            "ground_station_queue": gs_queue,
         }
 
     def _generate_new_tasks(self) -> List[Task]:
-        """Generates new unified tasks (Poisson per satellite) up to current sim time and pushes to queue."""
+        """Generate new tasks from the current source satellite."""
+        if not self.current_source_satellite:
+            return []
+        
         sim_time = self.orbit_propagator.simulation_time
-        new_tasks = self.task_generator.generate_unified_tasks(self.source_satellites, sim_time)
+        new_tasks = self.task_generator.generate_unified_tasks([self.current_source_satellite], sim_time)
         self.task_queue.extend(new_tasks)
         return new_tasks
 
-    def _get_next_task(self) -> Dict[str, List]:
-        """Advances simulation until a task becomes available, logging events."""
-        log = {'newly_generated_rs': []}
-        while not self.task_queue:
-            if self.steps_taken >= self.max_episode_steps:
-                self.current_task = None
-                return log
+    def _get_next_task(self) -> bool:
+        """
+        Get the next task from the queue.
+        
+        Returns:
+            True if a task was obtained, False if queue is empty
+        """
+        if self.task_queue:
+            self.current_task = self.task_queue.popleft()
+            return True
+        return False
 
-            self.orbit_propagator.advance_simulation_time(60)
-            self.orbit_propagator.update_satellite_positions(self.all_satellites)
-            self.steps_taken += 1
-
-            new_tasks = self._generate_new_tasks()
-            log['newly_generated_rs'].extend(new_tasks)
-
-        self.current_task = self.task_queue.popleft() if self.task_queue else None
-        return log
+    def _update_compute_node_queues(self, current_time: float):
+        """Update all compute node queues (process completed tasks)."""
+        all_nodes = get_all_compute_nodes()
+        for node in all_nodes:
+            node.update_queue(current_time)
 
     def reset(self, seed: Optional[int] = None, options: Optional[Dict] = None) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
         super().reset(seed=seed)
+        
+        # Reset time and counters
         self.orbit_propagator.simulation_time = self.start_time
         self.steps_taken = 0
+        self.valid_steps_taken = 0
+        self.tasks_processed = 0
         self.task_queue.clear()
         self.completed_tasks.clear()
 
-        for sat in self.compute_satellites:
-            sat.task_queue.clear()
-            sat.queue_load_flops = 0.0
+        # Clear all compute node queues
+        all_nodes = get_all_compute_nodes()
+        for node in all_nodes:
+            node.clear_queue()
+            node.last_update_time = 0.0
 
+        # Update satellite positions
         self.orbit_propagator.update_satellite_positions(self.all_satellites)
-        # Initialize Poisson arrivals per satellite starting from current sim time
-        self.task_generator.reset_arrivals(self.orbit_propagator.simulation_time, self.source_satellites)
-        self._get_next_task()
+        
+        # Update compute node positions
+        for node in all_nodes:
+            if node.node_type == "LEO":
+                for sat in self.compute_satellites:
+                    if sat.id == node.node_id:
+                        node.update_position(sat.position_ecef)
+                        break
+            elif node.node_type == "MEO":
+                for sat in self.leader_satellites:
+                    if sat.id == node.node_id:
+                        node.update_position(sat.position_ecef)
+                        break
+            elif node.node_type == "GROUND_STATION":
+                for gs in self.ground_stations:
+                    if gs.id == node.node_id:
+                        node.update_position(gs.position_ecef)
+                        break
+
+        # Randomly select a source satellite for this episode
+        self.current_source_satellite = self._rng.choice(self.source_satellites)
+        
+        # Initialize task generation for the selected source satellite
+        self.task_generator.reset_arrivals(self.orbit_propagator.simulation_time, [self.current_source_satellite])
+        
+        # Generate initial tasks and get the first one
+        self._generate_new_tasks()
+        if not self._get_next_task():
+            # If no task available, advance time until we get one
+            while not self.task_queue and self.steps_taken < 1000:
+                self.orbit_propagator.advance_simulation_time(60)
+                self.orbit_propagator.update_satellite_positions(self.all_satellites)
+                self._generate_new_tasks()
+                self.steps_taken += 1
+            self._get_next_task()
 
         return self._get_obs(), {}
 
-    def _calculate_latency_and_reward(self, k: int, assignment: np.ndarray) -> Tuple[float, float]:
-        if not self.current_task:
+    def _calculate_latency_and_reward(self, k: int, assignment: np.ndarray, slice_size: int, overlap_ratio: float) -> Tuple[float, float]:
+        """
+        Calculate latency and reward for the current task decision.
+        Also records a detailed breakdown in self._last_latency_debug when debug_latency is True.
+        
+        Returns:
+            (total_latency, reward)
+        """
+        if not self.current_task or not self.current_leader_satellite:
             return 0.0, 0.0
 
         source_sat = self.current_task.origin
-        # Use unified task attributes
-        slice_data_size_bits = self.current_task.data_size_bits / k
-        slice_flops = self.current_task.required_flops / k
-        # No explicit result size provided in the new model; assume negligible
-        slice_result_size_bits = 0.0
+        leader_node = self.current_leader_satellite
+        
+        # Task slice properties with redundancy and per-slice overheads
+        # Redundancy factor due to overlap (approx): 1/(1-r)^2, clipped to [1, 4]
+        red = 1.0
+        if overlap_ratio < 1.0:
+            red = 1.0 / max(1e-6, (1.0 - overlap_ratio) ** 2)
+        red = float(np.clip(red, 1.0, 4.0))
 
-        # Determine leader satellite (nearest MEO leader). If none configured, fall back to source-as-leader (legacy path)
-        if self.num_leader_satellites > 0:
-            dists = [links.get_distance_km(source_sat.position_ecef, ldr.position_ecef) for ldr in self.leader_satellites]
-            leader_idx = int(np.argmin(dists))
-            leader_sat = self.leader_satellites[leader_idx]
-            # Initial hop: source RS -> leader via ISL, send full data once
-            dist_rs_leader = dists[leader_idx]
-            isl_cap_rs_leader = links.get_isl_capacity_bps(dist_rs_leader, self.isl_frequency_ghz)
-            t_initial = (self.current_task.data_size_bits) / isl_cap_rs_leader if isl_cap_rs_leader > 0 else np.inf
-        else:
-            leader_sat = source_sat
-            t_initial = 0.0
+        # Per-slice overheads (configurable)
+        dl_cfg = self.sim_config.get('dl_model', {})
+        overhead_flops_per_slice = float(dl_cfg.get('overhead_flops_per_slice', 0.0))
+        header_bits_per_slice = float(dl_cfg.get('header_bits_per_slice', 0.0))
+
+        # Effective totals (include redundancy + per-slice overhead)
+        total_bits_eff = self.current_task.data_size_bits * red + k * header_bits_per_slice
+        total_flops_eff = self.current_task.required_flops * red + k * overhead_flops_per_slice
+
+        slice_data_size_bits = total_bits_eff / k
+        slice_flops = total_flops_eff / k
+
+        debug: Dict[str, Any] = {
+            'task_id': self.current_task.id,
+            'width': int(self.current_task.width),
+            'height': int(self.current_task.height),
+            'max_latency_sec': float(self.current_task.max_latency_sec),
+            'data_size_bits': int(self.current_task.data_size_bits),
+            'required_flops': float(self.current_task.required_flops),
+            'k_slices': int(k),
+        }
+
+        # Initial hop: source RS -> leader via ISL
+        dist_rs_leader = links.get_distance_km(source_sat.position_ecef, leader_node.position_ecef)
+        isl_cap_rs_leader = links.get_isl_capacity_bps(dist_rs_leader, self.isl_frequency_ghz)
+        t_initial = (self.current_task.data_size_bits) / isl_cap_rs_leader if isl_cap_rs_leader > 0 else np.inf
+        debug['source_to_leader'] = {
+            'distance_km': float(dist_rs_leader),
+            'isl_capacity_bps': float(isl_cap_rs_leader),
+            't_initial_sec': float(t_initial),
+        }
 
         latencies: List[float] = []
-        for dest_id, group in itertools.groupby(sorted(enumerate(assignment[:k]), key=lambda x: x[1]), key=lambda x: x[1]):
-            num_slices_for_dest = len(list(group))
+        per_dest: List[Dict[str, Any]] = []
+        
+        # Get the nearest compute satellites and ground station for this observation
+        nearest_compute = self._find_nearest_compute_satellites(
+            leader_node.position_ecef, 
+            self.num_nearest_compute
+        )
+        nearest_gs = self._find_nearest_ground_station(leader_node.position_ecef)
+        
+        # Build destination list: nearest_compute + nearest_gs
+        destinations = nearest_compute + ([nearest_gs] if nearest_gs else [])
 
-            if 0 <= dest_id < self.num_ground_stations:
-                # Destination is a Ground Station (cloud): leader downlinks raw slices, then compute on ground
-                gs = self.ground_stations[dest_id]
-                dist = links.get_distance_km(leader_sat.position_ecef, gs.position_ecef)
-                capacity = links.get_downlink_capacity_bps(dist, self.downlink_frequency_ghz)
-                t_trans = (num_slices_for_dest * slice_data_size_bits) / capacity if capacity > 0 else np.inf
-                t_comp = (num_slices_for_dest * slice_flops) / (gs.compute_gflops * 1e9)
-                latencies.append(t_initial + t_trans + t_comp)
-            else:
-                # Destination is a LEO Compute Satellite: leader sends raw slices via ISL to LEO, then queue+compute
-                sat_idx = dest_id - self.num_ground_stations
-                if 0 <= sat_idx < self.num_compute_satellites:
-                    target_sat = self.compute_satellites[sat_idx]
-                    dist_isl = links.get_distance_km(leader_sat.position_ecef, target_sat.position_ecef)
+        # Process assignment
+        for dest_idx, group in itertools.groupby(sorted(enumerate(assignment[:k]), key=lambda x: x[1]), key=lambda x: x[1]):
+            indices = list(group)
+            num_slices_for_dest = len(indices)
+            entry: Dict[str, Any] = {
+                'dest_index': int(dest_idx),
+                'num_slices': int(num_slices_for_dest),
+            }
+            
+            if dest_idx < len(destinations):
+                dest_node = destinations[dest_idx]
+                entry['node_type'] = dest_node.node_type
+                entry['node_compute_gflops'] = float(dest_node.compute_gflops)
+
+                if dest_node.node_type == "GROUND_STATION":
+                    # Downlink to ground station
+                    dist = links.get_distance_km(leader_node.position_ecef, dest_node.position_ecef)
+                    capacity = links.get_downlink_capacity_bps(dist, self.downlink_frequency_ghz)
+                    t_trans = (num_slices_for_dest * slice_data_size_bits) / capacity if capacity > 0 else np.inf
+                    t_comp = (num_slices_for_dest * slice_flops) / (dest_node.compute_gflops * 1e9)
+                    total = t_initial + t_trans + t_comp
+
+                    entry.update({
+                        'distance_km': float(dist),
+                        'downlink_capacity_bps': float(capacity),
+                        't_trans_sec': float(t_trans),
+                        't_comp_sec': float(t_comp),
+                        'path_latency_sec': float(total),
+                    })
+                    latencies.append(total)
+                else:
+                    # ISL to compute satellite (LEO or MEO)
+                    dist_isl = links.get_distance_km(leader_node.position_ecef, dest_node.position_ecef)
                     isl_capacity = links.get_isl_capacity_bps(dist_isl, self.isl_frequency_ghz)
                     t_isl = (num_slices_for_dest * slice_data_size_bits) / isl_capacity if isl_capacity > 0 else np.inf
-                    t_queue = target_sat.queue_load_flops / (target_sat.compute_gflops * 1e9)
-                    t_comp = (num_slices_for_dest * slice_flops) / (target_sat.compute_gflops * 1e9)
-                    # Add the task to the satellite's queue
+                    queue_before = dest_node.get_queue_load_flops()
+                    t_queue = queue_before / (dest_node.compute_gflops * 1e9)
+                    t_comp = (num_slices_for_dest * slice_flops) / (dest_node.compute_gflops * 1e9)
+                    
+                    # Add task to queue
                     task_flops = num_slices_for_dest * slice_flops
-                    target_sat.add_task_to_queue(task_flops)
-                    # Result downlink assumed negligible
-                    t_down = 0.0
-                    latencies.append(t_initial + t_isl + t_queue + t_comp + t_down)
+                    dest_node.add_task_slice(self.current_task.id, dest_idx, task_flops, 
+                                           self.orbit_propagator.simulation_time.timestamp())
+                    
+                    total = t_initial + t_isl + t_queue + t_comp
+                    entry.update({
+                        'distance_km': float(dist_isl),
+                        'isl_capacity_bps': float(isl_capacity),
+                        'queue_load_flops_before': float(queue_before),
+                        't_isl_sec': float(t_isl),
+                        't_queue_sec': float(t_queue),
+                        't_comp_sec': float(t_comp),
+                        'path_latency_sec': float(total),
+                    })
+                    latencies.append(total)
+            else:
+                entry['error'] = 'dest_index_out_of_range'
+                latencies.append(np.inf)
+            per_dest.append(entry)
 
         total_latency_sec = max(latencies) if latencies else 0.0
-        # Enforce max latency constraint: zero reward if violated
-        if total_latency_sec > self.current_task.max_latency_sec:
+        
+        # Reward: enforce max latency constraint
+        if total_latency_sec > self.current_task.max_latency_sec or np.isinf(total_latency_sec) or total_latency_sec < 0:
             reward = 0.0
         else:
             aoi = np.exp(-constants.AOI_DECAY_RATE_LAMBDA * total_latency_sec)
             reward = float(aoi)
+        
+        debug.update({
+            'destinations': per_dest,
+            'total_latency_sec': float(total_latency_sec),
+            'max_latency_sec': float(self.current_task.max_latency_sec),
+            'reward': float(reward),
+        })
+        if self.debug_latency:
+            self._last_latency_debug = debug
+
         return total_latency_sec, reward
 
     def step(self, action: Dict[str, np.ndarray]) -> Tuple[Dict[str, np.ndarray], float, bool, bool, Dict[str, Any]]:
+        """
+        Execute one step of the environment.
+        
+        Returns:
+            (obs, reward, terminated, truncated, info)
+        """
         info: Dict[str, Any] = {}
-        if self.current_task:
-            self.completed_tasks.append(self.current_task)
-
+        self.steps_taken += 1
+        
+        # Update compute node queues based on time elapsed since last step
+        current_time_sec = (self.orbit_propagator.simulation_time - self.start_time).total_seconds()
+        self._update_compute_node_queues(current_time_sec)
+        
+        # Check if we have a current task
         if not self.current_task:
-            wait_log = self._get_next_task()
+            # Try to get next task
+            if not self._get_next_task():
+                # No task available - episode ends
+                obs = self._get_obs()
+                truncated = self.tasks_processed >= self.max_tasks_per_episode
+                terminated = True
+                info['reason'] = 'No more tasks available'
+                return obs, 0.0, terminated, truncated, info
+        
+        # Find nearest visible MEO leader
+        self.current_leader_satellite = self._find_nearest_visible_leader(self.current_source_satellite)
+        
+        if not self.current_leader_satellite:
+            # No visible leader - skip this step (invalid)
+            info['reason'] = 'No visible MEO leader'
+            info['is_valid_step'] = False
             obs = self._get_obs()
-            truncated = self.steps_taken >= self.max_episode_steps
-            terminated = (not self.task_queue) and truncated
-            info.update(wait_log)
-            info['info'] = 'Agent was idle, waited for next task.'
-            return obs, 0.0, terminated, truncated, info
-
+            return obs, 0.0, False, False, info
+        
+        # Check if we have enough compute satellites
+        nearest_compute = self._find_nearest_compute_satellites(
+            self.current_leader_satellite.position_ecef, 
+            self.num_nearest_compute
+        )
+        
+        if len(nearest_compute) < self.num_nearest_compute:
+            # Not enough compute satellites - skip this step (invalid)
+            info['reason'] = f'Only {len(nearest_compute)} compute satellites visible (need {self.num_nearest_compute})'
+            info['is_valid_step'] = False
+            obs = self._get_obs()
+            return obs, 0.0, False, False, info
+        
+        # Valid step - process the action
+        info['is_valid_step'] = True
+        self.valid_steps_taken += 1
+        
+        # Parse action
         slice_size_idx, overlap_ratio_idx = action['slice_strategy']
         assignment = action['assignment']
         strategy = self.slicing_strategies[slice_size_idx]
@@ -283,37 +716,99 @@ class SatelliteEnv(gym.Env):
         overlap_ratio = strategy['overlap_ratios'][overlap_ratio_idx]
         k = self._calculate_k(slice_size, overlap_ratio)
 
-        total_latency_sec, reward = self._calculate_latency_and_reward(k, assignment)
+        # Calculate latency and reward
+        total_latency_sec, aoi_reward = self._calculate_latency_and_reward(k, assignment, slice_size, overlap_ratio)
 
+        # Advance simulation time
         time_to_advance = total_latency_sec
         if np.isinf(total_latency_sec) or total_latency_sec <= 0:
-            # Advance by a default interval if infeasible or zero
             time_to_advance = self.sim_config['task_generation'].get('interval_range_sec', [60, 300])[1]
 
         self.orbit_propagator.advance_simulation_time(time_to_advance)
         self.orbit_propagator.update_satellite_positions(self.all_satellites)
-        self.steps_taken += 1
+        
+        # Update compute node positions
+        all_nodes = get_all_compute_nodes()
+        for node in all_nodes:
+            if node.node_type == "LEO":
+                for sat in self.compute_satellites:
+                    if sat.id == node.node_id:
+                        node.update_position(sat.position_ecef)
+                        break
+            elif node.node_type == "MEO":
+                for sat in self.leader_satellites:
+                    if sat.id == node.node_id:
+                        node.update_position(sat.position_ecef)
+                        break
 
+        # Generate new tasks
         new_tasks = self._generate_new_tasks()
 
-        self._get_next_task()
+        # Mark current task as completed and fetch next
+        processed_task = self.current_task
+        has_next = self._get_next_task()
+        self.tasks_processed += 1
+        if processed_task is not None:
+            self.completed_tasks.append(processed_task)
 
-        truncated = self.steps_taken >= self.max_episode_steps
-        terminated = (not self.task_queue) and truncated
+        # Check termination
+        truncated = self.tasks_processed >= self.max_tasks_per_episode
+        terminated = truncated
+
+        # Compute mIoU component and final reward according to mode
+        # mIoU proxy from surrogate or table (monotone by design)
+        if self.use_monotone_surrogate:
+            xm = self._miou_surrogate(slice_size, overlap_ratio)
+            xm_source = 'surrogate'
+        else:
+            xm = self._miou_from_table(slice_size, overlap_ratio)
+            xm_source = 'table'
+
+        max_lat = float(self.current_task.max_latency_sec) if self.current_task else 0.0
+        violation = max(0.0, (total_latency_sec - max_lat) / max(max_lat, 1e-6)) if max_lat > 0 else 0.0
+        feasible = bool((total_latency_sec > 0) and (not np.isinf(total_latency_sec)) and (total_latency_sec <= max_lat))
+
+        mode = self.reward_mode
+        reward = 0.0
+        if mode == 'miou_hard_constraint':
+            if feasible:
+                latency_bonus = self.epsilon_latency_bonus * max(0.0, 1.0 - total_latency_sec / max_lat) if max_lat > 0 else 0.0
+                reward = float(xm + latency_bonus)
+            else:
+                reward = 0.0
+        elif mode == 'miou_soft_penalty':
+            reward = float(xm - self.penalty_lambda * violation)
+        elif mode == 'voi_multiplicative':
+            if feasible:
+                reward = float((xm ** self.voi_beta) * aoi_reward)
+            else:
+                reward = 0.0
+        else:
+            # default back to AoI only
+            reward = float(aoi_reward)
 
         obs = self._get_obs()
-        info = {
+        info.update({
             'total_latency': total_latency_sec,
             'chosen_slice_size': slice_size,
             'chosen_overlap_ratio': overlap_ratio,
             'calculated_k': k,
-            'newly_generated_rs_tasks': new_tasks,  # keep key name for backward compatibility
-        }
+            'tasks_processed': self.tasks_processed,
+            'valid_steps_taken': self.valid_steps_taken,
+            'aoi': float(aoi_reward),
+            'miou': float(xm),
+            'xm_source': xm_source,
+            'violation_ratio': float(violation),
+            'feasible': feasible,
+            'reward_mode': mode,
+        })
 
         return obs, reward, terminated, truncated, info
 
     def render(self, mode='human'):
         if mode == 'human':
             print(f"--- Sim Time: {self.orbit_propagator.simulation_time}, Step: {self.steps_taken} ---")
+            print(f"Current Source Satellite: {self.current_source_satellite}")
+            print(f"Current Leader: {self.current_leader_satellite}")
             print(f"Current Task: {self.current_task}")
-            print(f"Tasks in Queue: {len(self.task_queue)}")
+            print(f"Tasks Processed: {self.tasks_processed}/{self.max_tasks_per_episode}")

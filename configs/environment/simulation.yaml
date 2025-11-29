@@ -7,8 +7,11 @@ downlink_frequency_ghz: 12.0 # Ku-band for satellite to ground
 
 # Deep Learning Model parameters
 dl_model:
-  flops_per_pixel: 1000 # Example value: FLOPs needed to process one pixel
-  output_classes: 10    # Example value: Number of classes for the model output
+  flops_per_pixel: 1000   # FLOPs needed to process one pixel
+  output_classes: 10      # Number of classes for the model output
+  # New: per-slice overheads to avoid oversimplified 1/k splitting
+  header_bits_per_slice: 8000000        # 8 Mb header/protocol per slice (example)
+  overhead_flops_per_slice: 20000000    # 2e7 FLOPs per slice (example)
 
 # Ground Station parameters
 ground_station:
@@ -23,6 +26,39 @@ task_generation:
   image_size_range: [1024, 4096] # Min/max image width/height in pixels
   bands_range: [3, 8]            # Min/max number of spectral bands
   interval_range_sec: [60, 300]  # A new task is generated every 1-5 minutes
+  poisson_rate_per_sec: 0.01     # Task arrival rate (1 task per 100 seconds)
+
+# Episode and observation parameters for single-source training
+max_tasks_per_episode: 100              # Number of tasks to process per episode
+num_nearest_compute_satellites: 6      # Number of nearest compute satellites to observe
+isl_visibility_range_km: 25000.0        # Maximum distance for ISL visibility (expanded from 5000 km)
+
+# Model performance & reward configuration
+model_performance:
+  reward_mode: "miou_soft_penalty"     # 'miou_hard_constraint' | 'miou_soft_penalty' | 'voi_multiplicative'
+  use_monotone_surrogate: true         # use smooth monotone proxy for mIoU
+  penalty_lambda: 1.0                  # soft constraint penalty strength (for miou_soft_penalty)
+  beta: 0.7                            # mIoU weight in VoI when reward_mode=voi_multiplicative
+  epsilon_latency_bonus: 0.01          # small sorting term within feasible region (hard constraint)
+  surrogate:
+    s0: 1024                           # size scale (pixels)
+    alpha: 1.0                         # size curve exponent
+    tau: 0.2                           # overlap scale
+    beta: 1.0                          # overlap curve exponent
+    w_size: 0.7                        # weight of size term
+    w_overlap: 0.3                     # weight of overlap term
+    scale: [0.8, 1.0]                  # map to [scale_min, scale_max]
+    gamma: 1.0                         # power to adjust sensitivity
+  # Optional: real table (uncomment & fill if available)
+  # overlaps: [0.10, 0.15, 0.25, 0.50]
+  # miou_table:
+  #   "128":  [0.720, 0.725, 0.726, 0.725]
+  #   "256":  [0.734, 0.742, 0.737, 0.735]
+  #   "512":  [0.751, 0.749, 0.743, 0.739]
+  #   "1024": [0.745, 0.739, 0.743, 0.741]
+  #   "2048": [0.746, 0.744, 0.739, 0.741]
+  #   "4096": [0.726, 0.726, 0.726, 0.743]
+  # normalize: [0.72, 0.752]           # min-max normalization range for table
 
 # Slicing strategies for hierarchical actions
 # Defines the available options for the 'slice_strategy' action

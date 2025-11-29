@@ -37,6 +37,10 @@ def _get_isl_pointing_loss_db() -> float:
     Uses inverse transform sampling on the provided CDF.
     CDF: P(loss <= vartheta) = 1 - erf(sqrt(-ln(vartheta) / (2*alpha*sigma_p^2)))
     """
+    # Deterministic/stable mode for RL: disable random pointing loss if configured
+    if hasattr(constants, 'LINKS_USE_RANDOM_POINTING') and not constants.LINKS_USE_RANDOM_POINTING:
+        return 0.0
+
     # 1. Calculate alpha
     theta_3db_rad = np.deg2rad(constants.ISL_ANTENNA_3DB_BEAMWIDTH_DEG)
     alpha = (2 * np.log(2)) / (theta_3db_rad**2)
@@ -77,10 +81,13 @@ def calculate_system_noise_power_dbw(bandwidth_hz: float, noise_temp_k: float) -
 def get_isl_capacity_bps(distance_km: float, frequency_ghz: float) -> float:
     snr_db = get_isl_snr_db(distance_km, frequency_ghz)
     if np.isinf(snr_db):
-        return 0
+        return constants.MIN_ISL_CAPACITY_BPS if hasattr(constants, 'MIN_ISL_CAPACITY_BPS') else 0.0
     snr_linear = db_to_linear(snr_db)
     bandwidth_hz = constants.ISL_BANDWIDTH_TO_FREQUENCY_RATIO * (frequency_ghz * 1e9)
     capacity_bps = bandwidth_hz * np.log2(1 + snr_linear)
+    # Apply capacity floor for RL stability
+    if hasattr(constants, 'MIN_ISL_CAPACITY_BPS'):
+        capacity_bps = max(capacity_bps, constants.MIN_ISL_CAPACITY_BPS)
     return capacity_bps
 
 # --- Downlink Models ---
@@ -90,6 +97,10 @@ def _get_downlink_rician_loss_db() -> float:
     Generates a random sample for small-scale fading using a Rician model.
     The power is normalized to have a mean of 1 (0 dB).
     """
+    # Deterministic/stable mode for RL: disable Rician fading if configured
+    if hasattr(constants, 'LINKS_USE_RICIAN_FADING') and not constants.LINKS_USE_RICIAN_FADING:
+        return 0.0
+
     K = constants.DOWNLINK_RICIAN_FACTOR_K
     # Normalize power E[r^2] = 1
     sigma_sq = 1 / (2 * K + 2)
@@ -117,31 +128,37 @@ def get_isl_snr_db(distance_km: float, frequency_ghz: float) -> float:
     noise_power_dbw = calculate_system_noise_power_dbw(bandwidth_hz, noise_temp)
     
     snr_db = p_t_dbw + g_db + g_db - l_t_db - noise_power_dbw
+    # Apply lower bound to avoid extreme negative SNRs causing near-zero capacity
+    if hasattr(constants, 'MIN_ISL_SNR_DB'):
+        snr_db = max(snr_db, constants.MIN_ISL_SNR_DB)
     return snr_db
 
 def get_downlink_capacity_bps(distance_km: float, frequency_ghz: float) -> float:
     """
-    Calculates the downlink capacity based on the CNR formula.
-    This is a placeholder for a full CNR calculation which would require more constants
-    like EIRP, G/T etc. We simulate the CNR directly for now.
+    Calculates the downlink capacity based on a simplified CNR formula.
+    RL-stable version:
+    - Optional: disable Rician fading via constants.LINKS_USE_RICIAN_FADING
+    - Apply CNR lower-bound (MIN_DOWNLINK_CNR_DB)
+    - Apply capacity floor (MIN_DOWNLINK_CAPACITY_BPS)
     """
-    # Simplified CNR calculation
-    # A real implementation would require EIRP, G/T, etc.
-    # We simulate a base CNR that degrades with distance and random fading.
-    base_cnr_db = 50.0 # A strong signal base CNR
-    fspl_db = constants.FSPL_BASE_LOSS_DB + 20 * np.log10(distance_km) + 20 * np.log10(frequency_ghz)
+    base_cnr_db = 50.0  # baseline CNR before path loss and environment
+    fspl_db = constants.FSPL_BASE_LOSS_DB + 20 * np.log10(max(distance_km, 1e-3)) + 20 * np.log10(max(frequency_ghz, 1e-6))
     rician_loss_db = _get_downlink_rician_loss_db()
-    
-    # Final CNR
+
     cnr_db = base_cnr_db - (fspl_db - constants.FSPL_BASE_LOSS_DB) + rician_loss_db - constants.DOWNLINK_ENV_LOSS_DB
-    
-    if cnr_db < constants.DOWNLINK_CNR_THRESHOLD_DB:
-        return 0.0
+
+    # Soften hard thresholding: floor the CNR to avoid zero capacity
+    if hasattr(constants, 'MIN_DOWNLINK_CNR_DB'):
+        cnr_db = max(cnr_db, constants.MIN_DOWNLINK_CNR_DB)
 
     cnr_linear = db_to_linear(cnr_db)
-    # Assuming bandwidth is a fraction of frequency for simplicity, similar to ISL
     bandwidth_hz = 0.01 * (frequency_ghz * 1e9)
     capacity_bps = bandwidth_hz * np.log2(1 + cnr_linear)
+
+    # Apply capacity floor for RL stability
+    if hasattr(constants, 'MIN_DOWNLINK_CAPACITY_BPS'):
+        capacity_bps = max(capacity_bps, constants.MIN_DOWNLINK_CAPACITY_BPS)
+
     return capacity_bps
 
 # --- Uplink Models ---

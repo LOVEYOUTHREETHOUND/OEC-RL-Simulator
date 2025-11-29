@@ -30,36 +30,53 @@ except Exception:  # pragma: no cover
 def get_tle_data(norad_id: int, cache_dir: str, cache_duration_hours: int = 24) -> Optional[List[str]]:
     """Fetch TLE by NORAD ID, with local caching.
     Returns a list of non-empty lines from cache or remote, or None on failure.
+    
+    Fallback behavior: if remote fetch is unavailable or fails, return cached
+    file contents even if stale, to keep simulations running offline.
     """
     os.makedirs(cache_dir, exist_ok=True)
     cache_file = os.path.join(cache_dir, f"{norad_id}.tle")
 
-    if os.path.exists(cache_file):
-        file_mod_time = datetime.fromtimestamp(os.path.getmtime(cache_file))
-        if (datetime.now() - file_mod_time) < timedelta(hours=cache_duration_hours):
+    # Helper to read cache (fresh or stale)
+    def _read_cache() -> Optional[List[str]]:
+        if os.path.exists(cache_file):
             try:
                 with open(cache_file, 'r', encoding='utf-8') as f:
                     return [ln.strip() for ln in f.readlines() if ln.strip()]
             except Exception:
-                pass
-
-    if not REQUESTS_AVAILABLE:
-        print(f"\n[WARNING] 'requests' not installed. Cannot fetch TLE for {norad_id}.")
+                return None
         return None
 
-    url = f"https://celestrak.org/NORAD/elements/gp.php?CATNR={norad_id}&FORMAT=tle"
-    try:
-        resp = requests.get(url, timeout=30, verify=False)
-        resp.raise_for_status()
-        text = resp.text.strip()
-        if not text or "No TLE found" in text:
-            return None
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        with open(cache_file, 'w', encoding='utf-8') as f:
-            f.write("\n".join(lines))
-        return lines
-    except Exception:
-        return None
+    # Use fresh cache if available
+    if os.path.exists(cache_file):
+        file_mod_time = datetime.fromtimestamp(os.path.getmtime(cache_file))
+        if (datetime.now() - file_mod_time) < timedelta(hours=cache_duration_hours):
+            cached = _read_cache()
+            if cached:
+                return cached
+
+    # Try remote fetch if requests available
+    if REQUESTS_AVAILABLE:
+        url = f"https://celestrak.org/NORAD/elements/gp.php?CATNR={norad_id}&FORMAT=tle"
+        try:
+            resp = requests.get(url, timeout=30, verify=False)
+            resp.raise_for_status()
+            text = resp.text.strip()
+            if text and "No TLE found" not in text:
+                lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+                try:
+                    with open(cache_file, 'w', encoding='utf-8') as f:
+                        f.write("\n".join(lines))
+                except Exception:
+                    pass
+                return lines
+        except Exception:
+            pass
+    else:
+        print(f"\n[WARNING] 'requests' not installed. Using cached TLE for {norad_id} if available.")
+
+    # Fallback: return cached file even if stale
+    return _read_cache()
 
 # -----------------------------
 # Group-based name matching
