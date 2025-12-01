@@ -35,7 +35,7 @@ def parse_args():
     p.add_argument("--sats_config", default=os.path.join("configs", "satellites.yaml"))
     p.add_argument("--total_timesteps", type=int, default=2_000_000)
     p.add_argument("--n_envs", type=int, default=8)
-    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--seed", type=int, default=3407)
     p.add_argument("--run_name", type=str, default=None)
     p.add_argument("--use_subproc", action="store_true")
     # Fast/clear-convergence knobs
@@ -126,7 +126,9 @@ def main():
                                 models_dir=paths["models"],
                                 evals_dir=paths["evals"],
                                 best_model_name="best_model",
-                                save_freq_steps=100_000)
+                                save_freq_steps=10000,
+                                train_logs_dir=paths["train_logs"],
+                                log_rotate_every_episodes=100)
 
     # Train
     model.learn(total_timesteps=args.total_timesteps, callback=callbacks, progress_bar=True)

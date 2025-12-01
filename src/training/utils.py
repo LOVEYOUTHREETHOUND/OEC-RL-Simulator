@@ -24,6 +24,8 @@ import gymnasium as gym
 from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback, BaseCallback
+import json as _json
+from datetime import datetime as _dt
 
 # Resolve project root and import local modules
 _project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -33,7 +35,99 @@ if _project_root not in sys.path:
 from src.utils.config_loader import load_config
 from src.utils.tle_loader import preprocess_satellite_configs
 from src.environment.satellite_env import SatelliteEnv
+
+class ObservationScaler(gym.ObservationWrapper):
+    """Scale observations to comparable ranges.
+    Injects raw (unscaled) observation into info['_raw_obs'] for logging.
+    Constants can be provided via constructor; otherwise defaults used.
+    """
+    def __init__(self, env: gym.Env, *,
+                 enabled: bool = True,
+                 Re: float = 6_371_000.0,
+                 Wmax: float = 6000.0,
+                 Hmax: float = 6000.0,
+                 LatMax: float = 500.0,
+                 BitsTot: float = (6000.0*6000.0*24.0),
+                 FLOPsRef: float = 1.39e12,
+                 QueueRef: float = 1e12,
+                 RateRef: float = 1e9,
+                 clip_pos: float = 2.0,
+                 clip_queue: float = 10.0) -> None:
+        super().__init__(env)
+        self.enabled = bool(enabled)
+        self.Re = float(Re)
+        self.Wmax = float(Wmax)
+        self.Hmax = float(Hmax)
+        self.LatMax = float(LatMax)
+        self.BitsTot = float(BitsTot)
+        self.FLOPsRef = float(FLOPsRef)
+        self.QueueRef = float(QueueRef)
+        self.RateRef = float(RateRef)
+        self.clip_pos = float(clip_pos)
+        self.clip_queue = float(clip_queue)
+        self._last_raw_obs = None
+
+    def _scale_obs(self, obs: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+        if not self.enabled or obs is None:
+            return obs
+        o = dict(obs)
+        # positions
+        if 'task_origin_pos' in o:
+            o['task_origin_pos'] = np.clip(o['task_origin_pos'] / self.Re, -self.clip_pos, self.clip_pos)
+        if 'leader_pos' in o:
+            o['leader_pos'] = np.clip(o['leader_pos'] / self.Re, -self.clip_pos, self.clip_pos)
+        if 'compute_pos' in o:
+            o['compute_pos'] = np.clip(o['compute_pos'] / self.Re, -self.clip_pos, self.clip_pos)
+        if 'ground_station_pos' in o:
+            o['ground_station_pos'] = np.clip(o['ground_station_pos'] / self.Re, -self.clip_pos, self.clip_pos)
+        # queues
+        if 'compute_queues' in o:
+            o['compute_queues'] = np.clip(o['compute_queues'] / self.QueueRef, 0.0, self.clip_queue)
+        if 'ground_station_queue' in o:
+            o['ground_station_queue'] = np.clip(o['ground_station_queue'] / self.QueueRef, 0.0, self.clip_queue)
+        # task_info
+        if 'task_info' in o and isinstance(o['task_info'], np.ndarray):
+            ti = o['task_info'].astype(np.float32)
+            # expect [W,H,max_lat,data_bits,required_flops,ratio,rate]
+            if ti.shape[0] >= 1:
+                ti[0] = ti[0] / self.Wmax
+            if ti.shape[0] >= 2:
+                ti[1] = ti[1] / self.Hmax
+            if ti.shape[0] >= 3:
+                ti[2] = ti[2] / self.LatMax
+            if ti.shape[0] >= 4:
+                ti[3] = ti[3] / self.BitsTot
+            if ti.shape[0] >= 5:
+                ti[4] = ti[4] / self.FLOPsRef
+            if ti.shape[0] >= 6:
+                # ratio_sec_per_bit，常见取值很小，这里乘 RateRef 让量级接近 1
+                ti[6-1] = np.clip(ti[6-1] * self.RateRef, 0.0, 10.0)
+            if ti.shape[0] >= 7:
+                # required_rate_bps
+                ti[7-1] = np.clip(ti[7-1] / self.RateRef, 0.0, 10.0)
+            o['task_info'] = ti
+        return o
+
+    def observation(self, observation: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+        self._last_raw_obs = observation
+        return self._scale_obs(observation)
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        raw = obs
+        scaled = self._scale_obs(raw)
+        # 将未归一化观测注入 info，供日志使用
+        try:
+            if isinstance(info, dict):
+                info.setdefault('_raw_obs', raw)
+            # 对 VecEnv 场景，Monitor/VecEnv 会聚合为 list[dict]，每个 env 自己的 wrapper 会注入
+        except Exception:
+            pass
+        return scaled, reward, terminated, truncated, info
+
 from src.training.action_wrappers import FlattenedDictActionWrapper
+
+
 
 
 class InfoScalarCallback(BaseCallback):
@@ -166,6 +260,223 @@ class EpisodeRewardCallback(BaseCallback):
         return True
 
 
+class TrainingJSONLoggerCallback(BaseCallback):
+    """Write detailed per-step logs for analysis.
+    - Writes JSON lines into rotated files every `rotate_every_episodes` episodes.
+    - Each line contains timesteps, episode index, reward, action, and `info` including latency_debug.
+    """
+    def __init__(self, logs_dir: str, rotate_every_episodes: int = 100, verbose: int = 0):
+        super().__init__(verbose)
+        self.logs_dir = logs_dir
+        self.rotate_every_episodes = max(1, int(rotate_every_episodes))
+        os.makedirs(self.logs_dir, exist_ok=True)
+        self.episode_idx = 0
+        self._file = None
+        self._file_path = None
+
+    def _open_file(self):
+        start = (self.episode_idx // self.rotate_every_episodes) * self.rotate_every_episodes + 1
+        end = start + self.rotate_every_episodes - 1
+        fname = f"train_ep_{start:06d}-{end:06d}.jsonl"
+        self._file_path = os.path.join(self.logs_dir, fname)
+        # open append to continue across sessions in same range
+        self._file = open(self._file_path, 'a', encoding='utf-8')
+
+    def _close_file(self):
+        if self._file:
+            try:
+                self._file.close()
+            except Exception:
+                pass
+            self._file = None
+
+    def _maybe_rotate(self):
+        if self._file is None:
+            self._open_file()
+            return
+        start = (self.episode_idx // self.rotate_every_episodes) * self.rotate_every_episodes + 1
+        expected_name = f"train_ep_{start:06d}-{start + self.rotate_every_episodes - 1:06d}.jsonl"
+        if os.path.basename(self._file_path) != expected_name:
+            self._close_file()
+            self._open_file()
+
+    def _on_step(self) -> bool:
+        try:
+            infos = self.locals.get('infos', None)
+            actions = self.locals.get('actions', None)
+            rewards = self.locals.get('rewards', None)
+            # rotate when we pass episode boundary
+            if infos is not None:
+                for info in infos:
+                    ep_info = info.get('episode') if isinstance(info, dict) else None
+                    if ep_info is not None:
+                        self.episode_idx += 1
+                        self._maybe_rotate()
+            # build log entry
+            entry = {
+                'time': _dt.utcnow().isoformat() + 'Z',
+                'timesteps': int(self.num_timesteps),
+                'episode_idx': int(self.episode_idx),
+            }
+            if rewards is not None:
+                try:
+                    entry['reward_mean'] = float(np.mean(rewards))
+                except Exception:
+                    pass
+            if isinstance(actions, np.ndarray):
+                entry['actions'] = actions.tolist()
+            # we expect first info to have details
+            if infos and len(infos) > 0 and isinstance(infos[0], dict):
+                entry['info'] = infos[0]
+            # write line
+            self._maybe_rotate()
+            if self._file is None:
+                self._open_file()
+            self._file.write(_json.dumps(entry, ensure_ascii=False) + "\n")
+            self._file.flush()
+        except Exception:
+            pass
+        return True
+
+    def _on_training_end(self) -> None:
+        self._close_file()
+
+
+class PlainTextLoggerCallback(BaseCallback):
+    """Human-readable plain text logger.
+    Writes one line per step with raw (unscaled) observation task_info, action, and latency breakdown summary.
+    Rotates every N episodes.
+    """
+    def __init__(self, logs_dir: str, rotate_every_episodes: int = 100, verbose: int = 0):
+        super().__init__(verbose)
+        self.logs_dir = logs_dir
+        self.rotate_every_episodes = max(1, int(rotate_every_episodes))
+        os.makedirs(self.logs_dir, exist_ok=True)
+        self.episode_idx = 0
+        self._file = None
+        self._file_path = None
+
+    def _open_file(self):
+        start = (self.episode_idx // self.rotate_every_episodes) * self.rotate_every_episodes + 1
+        end = start + self.rotate_every_episodes - 1
+        fname = f"train_ep_{start:06d}-{end:06d}.log"
+        self._file_path = os.path.join(self.logs_dir, fname)
+        self._file = open(self._file_path, 'a', encoding='utf-8')
+
+    def _close_file(self):
+        if self._file:
+            try:
+                self._file.close()
+            except Exception:
+                pass
+            self._file = None
+
+    def _maybe_rotate(self):
+        if self._file is None:
+            self._open_file()
+            return
+        start = (self.episode_idx // self.rotate_every_episodes) * self.rotate_every_episodes + 1
+        expected = f"train_ep_{start:06d}-{start + self.rotate_every_episodes - 1:06d}.log"
+        if os.path.basename(self._file_path) != expected:
+            self._close_file()
+            self._open_file()
+
+    def _format_task_info_raw(self, raw_obs: Dict[str, Any]) -> str:
+        try:
+            ti = raw_obs.get('task_info', None)
+            if isinstance(ti, np.ndarray) and ti.size >= 7:
+                W, H, max_lat, bits, flops, ratio, rate = [float(x) for x in ti[:7]]
+                return f"task_info_raw=[W={W:.0f},H={H:.0f},max_lat={max_lat:.3f},bits={bits:.0f},flops={flops:.2e},ratio={ratio:.3e},rate={rate:.3e}]"
+        except Exception:
+            pass
+        return "task_info_raw=[]"
+
+    def _format_latency_summary(self, lat_dbg: Dict[str, Any]) -> str:
+        if not isinstance(lat_dbg, dict):
+            return "latency={}"
+        try:
+            t_init = lat_dbg.get('source_to_leader', {}).get('t_initial_sec', None)
+            dests = lat_dbg.get('destinations', []) or []
+            parts = []
+            if t_init is not None:
+                parts.append(f"t_init={float(t_init):.3f}s")
+            # summarize up to first 5 destinations
+            for i, d in enumerate(dests[:5]):
+                p = d.get('path_latency_sec', None)
+                t_trans = d.get('t_trans_sec', None) or d.get('t_isl_sec', None)
+                t_q = d.get('t_queue_sec', None)
+                t_c = d.get('t_comp_sec', None)
+                seg = []
+                if p is not None:
+                    seg.append(f"path={float(p):.3f}")
+                if t_trans is not None:
+                    seg.append(f"trans={float(t_trans):.3f}")
+                if t_q is not None:
+                    seg.append(f"queue={float(t_q):.3f}")
+                if t_c is not None:
+                    seg.append(f"comp={float(t_c):.3f}")
+                parts.append(f"dest{i}({','.join(seg)})")
+            return "latency={" + "; ".join(parts) + "}"
+        except Exception:
+            return "latency={}"
+
+    def _on_step(self) -> bool:
+        try:
+            infos = self.locals.get('infos', None)
+            actions = self.locals.get('actions', None)
+            # rotate when we pass episode boundary
+            if infos is not None:
+                for info in infos:
+                    ep_info = info.get('episode') if isinstance(info, dict) else None
+                    if ep_info is not None:
+                        self.episode_idx += 1
+                        self._maybe_rotate()
+            # choose first env's info for line output
+            info0 = None
+            if isinstance(infos, (list, tuple)) and len(infos) > 0 and isinstance(infos[0], dict):
+                info0 = infos[0]
+            # build fields
+            step = int(self.num_timesteps)
+            env_id = info0.get('env_id', 0) if isinstance(info0, dict) else 0
+            miou = info0.get('miou', None) if isinstance(info0, dict) else None
+            reward = info0.get('reward', None) if isinstance(info0, dict) else None
+            feasible = info0.get('feasible', None) if isinstance(info0, dict) else None
+            total_lat = info0.get('total_latency', None) if isinstance(info0, dict) else None
+            slice_size = info0.get('chosen_slice_size', None) if isinstance(info0, dict) else None
+            k = info0.get('calculated_k', None) if isinstance(info0, dict) else None
+            assign = info0.get('assignment', None) if isinstance(info0, dict) else None
+            lat_dbg = info0.get('latency_debug', None) if isinstance(info0, dict) else None
+            raw_obs = info0.get('_raw_obs', None) if isinstance(info0, dict) else None
+            sim_time = info0.get('sim_time', 'NA') if isinstance(info0, dict) else 'NA'
+            curr_max_lat = lat_dbg.get('max_latency_sec', None) if isinstance(lat_dbg, dict) else None
+
+            # format line
+            head = f"[{_dt.utcnow().isoformat()}Z] sim_time={sim_time} step={step} ep={self.episode_idx} env={env_id} slice={slice_size} k={k} feasible={int(bool(feasible)) if feasible is not None else 'NA'} miou={miou if miou is not None else 'NA'} reward={reward if reward is not None else 'NA'} total_latency={total_lat if total_lat is not None else 'NA'} curr_max_lat={curr_max_lat if curr_max_lat is not None else 'NA'}"
+            ti_line = self._format_task_info_raw(raw_obs if isinstance(raw_obs, dict) else {})
+            # assignment summary (print first 16)
+            assign_line = "assignment=[]"
+            try:
+                if isinstance(assign, (list, tuple)):
+                    first = assign[: min(len(assign), 16)]
+                    more = len(assign) - len(first)
+                    assign_line = f"assignment={first}{'...(+'+str(more)+')' if more>0 else ''}"
+            except Exception:
+                pass
+            lat_line = self._format_latency_summary(lat_dbg)
+            line = f"{head} | {ti_line} | {assign_line} | {lat_line}\n"
+            self._maybe_rotate()
+            if self._file is None:
+                self._open_file()
+            self._file.write(line)
+            self._file.flush()
+        except Exception:
+            pass
+        return True
+
+    def _on_training_end(self) -> None:
+        self._close_file()
+
+
 class ObservationSanitizer(gym.ObservationWrapper):
     """Sanitize Dict observations by replacing NaN/Inf and optional clipping.
 
@@ -240,19 +551,37 @@ def _build_single_env(sim_config_path: str,
             env = FlattenedDictActionWrapper(env)
         # Sanitize observations to avoid NaN/Inf propagating to the policy
         env = ObservationSanitizer(env, nan_value=0.0, posinf=1e9, neginf=-1e9, clip=None)
+        # Optional ObservationScaler (default enabled)
+        try:
+            scaler_cfg = sim_config.get('observation_scaler', {}) or {}
+            enabled = scaler_cfg.get('enabled', True)
+            env = ObservationScaler(
+                env,
+                enabled=enabled,
+                Re=float(scaler_cfg.get('Re', 6_371_000.0)),
+                Wmax=float(scaler_cfg.get('Wmax', 6000.0)),
+                Hmax=float(scaler_cfg.get('Hmax', 6000.0)),
+                LatMax=float(scaler_cfg.get('LatMax', 500.0)),
+                BitsTot=float(scaler_cfg.get('BitsTot', 6000.0*6000.0*24.0)),
+                FLOPsRef=float(scaler_cfg.get('FLOPsRef', 1.39e12)),
+                QueueRef=float(scaler_cfg.get('QueueRef', 1e12)),
+                RateRef=float(scaler_cfg.get('RateRef', 1e9)),
+                clip_pos=float(scaler_cfg.get('clip_pos', 2.0)),
+                clip_queue=float(scaler_cfg.get('clip_queue', 10.0)),
+            )
+        except Exception:
+            pass
         # Monitor for episode stats
         if monitor_log_dir:
             os.makedirs(monitor_log_dir, exist_ok=True)
             env = Monitor(env, filename=None, info_keywords=(
                 "total_latency",
                 "calculated_k",
-                "aoi",
                 "miou",
-                "violation_ratio",
                 "feasible",
                 "reward_mode",
                 "chosen_slice_size",
-                "chosen_overlap_ratio"
+                "reward"
             ))
         # Seed
         env.reset(seed=seed)
@@ -297,6 +626,8 @@ def prepare_run_dirs(algo: str, run_name: Optional[str] = None) -> Dict[str, str
         models/{algo}/{run_name}/
         logs/{algo}/{run_name}/tb/
         logs/{algo}/{run_name}/monitor/
+        logs/{algo}/{run_name}/train_logs/ (JSONL)
+        logs/{algo}/{run_name}/train_plain_logs/ (.log)
         evals/{algo}/{run_name}/
     Returns a dict with paths.
     """
@@ -307,6 +638,8 @@ def prepare_run_dirs(algo: str, run_name: Optional[str] = None) -> Dict[str, str
         "models": os.path.join(base_results, "models", algo, run),
         "tb": os.path.join(base_results, "logs", algo, run, "tb"),
         "monitor": os.path.join(base_results, "logs", algo, run, "monitor"),
+        "train_logs": os.path.join(base_results, "logs", algo, run, "train_logs"),
+        "train_plain_logs": os.path.join(base_results, "logs", algo, run, "train_plain_logs"),
         "evals": os.path.join(base_results, "evals", algo, run),
         "meta": os.path.join(base_results, "logs", algo, run, "metadata.json"),
     }
@@ -331,12 +664,16 @@ def build_callbacks(eval_env,
                     best_model_name: str = "best_model",
                     save_freq_steps: int = 100_000,
                     info_keys: Optional[List[str]] = None,
-                    info_log_every: int = 1000,
+                    info_log_every: int = 200,
                     enable_step_reward_ma: bool = True,
                     step_ma_window: int = 1000,
                     step_ma_log_every: int = 200,
                     enable_episode_reward: bool = True,
-                    episode_log_prefix: str = 'by_episode') -> List:
+                    episode_log_prefix: str = 'by_episode',
+                    enable_episode_feasible: bool = True,
+                    train_logs_dir: Optional[str] = None,
+                    train_plain_logs_dir: Optional[str] = None,
+                    log_rotate_every_episodes: int = 100) -> List:
     """Create standard callbacks: Eval, periodic Checkpoint, and optional InfoScalar logging.
 
     Args:
@@ -352,7 +689,7 @@ def build_callbacks(eval_env,
         eval_env=eval_env,
         best_model_save_path=models_dir,
         log_path=evals_dir,
-        eval_freq=10_000,
+        eval_freq=1000,
         deterministic=True,
         render=False,
     )
@@ -376,5 +713,23 @@ def build_callbacks(eval_env,
     # Episode-wise reward using episode index as x-axis
     if enable_episode_reward:
         cbs.append(EpisodeRewardCallback(prefix=episode_log_prefix, verbose=0))
+
+    # JSONL training logger
+    if train_logs_dir:
+        cbs.append(TrainingJSONLoggerCallback(logs_dir=train_logs_dir,
+                                              rotate_every_episodes=log_rotate_every_episodes,
+                                              verbose=0))
+
+    # JSONL training logger
+    if train_logs_dir:
+        cbs.append(TrainingJSONLoggerCallback(logs_dir=train_logs_dir,
+                                              rotate_every_episodes=log_rotate_every_episodes,
+                                              verbose=0))
+
+    # Plain text training logger
+    if train_plain_logs_dir:
+        cbs.append(PlainTextLoggerCallback(logs_dir=train_plain_logs_dir,
+                                           rotate_every_episodes=log_rotate_every_episodes,
+                                           verbose=0))
 
     return cbs

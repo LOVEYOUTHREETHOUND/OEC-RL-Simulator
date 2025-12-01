@@ -235,31 +235,25 @@ class SatelliteEnv(gym.Env):
     def _define_spaces(self):
         """Define action and observation spaces."""
         num_slice_sizes = len(self.slicing_strategies)
-        num_overlap_ratios = len(self.slicing_strategies[0]['overlap_ratios']) if num_slice_sizes > 0 else 0
 
-        # Use the smallest slice size and the largest overlap to estimate the worst-case k
+        # Use the smallest slice size to estimate the worst-case k (no overlap)
         if num_slice_sizes > 0:
             min_slice_size = min(s['slice_size'] for s in self.slicing_strategies)
-            all_overlaps = []
-            for s in self.slicing_strategies:
-                all_overlaps.extend(s.get('overlap_ratios', []))
-            max_overlap = max(all_overlaps) if all_overlaps else 0.0
         else:
             min_slice_size = 512
-            max_overlap = 0.0
-        max_k = self._calculate_k(min_slice_size, max_overlap)
+        max_k = self._calculate_k(min_slice_size)
 
         # Destinations: num_nearest_compute satellites + 1 ground station
         num_destinations = self.num_nearest_compute + 1
         
         self.action_space = spaces.Dict({
-            'slice_strategy': spaces.MultiDiscrete([num_slice_sizes, num_overlap_ratios]),
+            'slice_strategy': spaces.MultiDiscrete([num_slice_sizes]),
             'assignment': spaces.MultiDiscrete([num_destinations] * max_k)
         })
 
         self.observation_space = spaces.Dict({
             "task_origin_pos": spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32),
-            "task_info": spaces.Box(low=0, high=np.inf, shape=(5,), dtype=np.float32),
+            "task_info": spaces.Box(low=0, high=np.inf, shape=(7,), dtype=np.float32),
             "leader_pos": spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32),
             "compute_pos": spaces.Box(low=-np.inf, high=np.inf, shape=(self.num_nearest_compute, 3), dtype=np.float32),
             "compute_queues": spaces.Box(low=0, high=np.inf, shape=(self.num_nearest_compute,), dtype=np.float32),
@@ -283,16 +277,25 @@ class SatelliteEnv(gym.Env):
         else:
             return [GroundStation(gs_id=0, lat_deg=0, lon_deg=0, config=gs_config)]
 
-    def _calculate_k(self, slice_size: int, overlap_ratio: float) -> int:
-        """Calculate number of slices based on task properties."""
+    def _calculate_k(self, slice_size: int) -> int:
+        """Calculate number of slices based on task properties.
+        If current_task is not yet set, fall back to configured fixed_size (if fixed_mode)
+        or to image_size_range max.
+        """
         if not self.current_task:
-            max_size = self.sim_config['task_generation']['image_size_range'][1]
-            img_w, img_h = max_size, max_size
+            tg = self.sim_config.get('task_generation', {})
+            if bool(tg.get('fixed_mode', True)):
+                fs = tg.get('fixed_size', [6000, 6000])
+                img_w = int(fs[0])
+                img_h = int(fs[1])
+            else:
+                max_size = tg.get('image_size_range', [1024, 1024])[1]
+                img_w, img_h = int(max_size), int(max_size)
         else:
             img_w, img_h = self.current_task.width, self.current_task.height
 
-        stride = slice_size * (1 - overlap_ratio)
-        if stride == 0:
+        stride = float(slice_size)
+        if stride <= 0:
             return 1
         slices_w = math.ceil((img_w - slice_size) / stride) + 1 if img_w > slice_size else 1
         slices_h = math.ceil((img_h - slice_size) / stride) + 1 if img_h > slice_size else 1
@@ -376,12 +379,19 @@ class SatelliteEnv(gym.Env):
             self.current_leader_satellite = self._find_nearest_visible_leader(self.current_source_satellite)
 
         task_origin_pos = self.current_task.origin.position_ecef.astype(np.float32)
+        # Build task_info with extra difficulty features
+        data_bits = float(self.current_task.data_size_bits)
+        max_lat = float(self.current_task.max_latency_sec)
+        ratio_sec_per_bit = max_lat / max(data_bits, 1.0)
+        required_rate_bps = data_bits / max(max_lat, 1e-6)
         task_info = np.array([
             self.current_task.width,
             self.current_task.height,
-            self.current_task.max_latency_sec,
-            self.current_task.data_size_bits,
+            max_lat,
+            data_bits,
             self.current_task.required_flops,
+            ratio_sec_per_bit,
+            required_rate_bps,
         ], dtype=np.float32)
         
         # Leader position (may be zeros if leader not found yet)
@@ -510,38 +520,161 @@ class SatelliteEnv(gym.Env):
 
         return self._get_obs(), {}
 
-    def _calculate_latency_and_reward(self, k: int, assignment: np.ndarray, slice_size: int, overlap_ratio: float) -> Tuple[float, float]:
+    def _calculate_latency_and_reward(self, k: int, assignment: np.ndarray, slice_size: int, overlap_ratio: float) -> Tuple[float, float, float, bool, Dict[str, Any]]:
         """
         Calculate latency and reward for the current task decision.
-        Also records a detailed breakdown in self._last_latency_debug when debug_latency is True.
-        
-        Returns:
-            (total_latency, reward)
+        Modified logic per user's requirement:
+        - Fixed task size (handled by generator), per-slice data bits = slice_size*slice_size*24
+        - Compute per-slice FLOPs from empirical table by slice_size
+        - Network transmission uses per-slice bits; source->leader sends ALL k slices; leader->dest sends
+          assigned slices per destination.
+        - Reward uses hard constraint: reward=xm if total_latency<=max_latency else 0
         """
         if not self.current_task or not self.current_leader_satellite:
-            return 0.0, 0.0
+            return 0.0, 0.0, 0.0, False, {}
 
         source_sat = self.current_task.origin
         leader_node = self.current_leader_satellite
-        
-        # Task slice properties with redundancy and per-slice overheads
-        # Redundancy factor due to overlap (approx): 1/(1-r)^2, clipped to [1, 4]
-        red = 1.0
-        if overlap_ratio < 1.0:
-            red = 1.0 / max(1e-6, (1.0 - overlap_ratio) ** 2)
-        red = float(np.clip(red, 1.0, 4.0))
 
-        # Per-slice overheads (configurable)
-        dl_cfg = self.sim_config.get('dl_model', {})
-        overhead_flops_per_slice = float(dl_cfg.get('overhead_flops_per_slice', 0.0))
-        header_bits_per_slice = float(dl_cfg.get('header_bits_per_slice', 0.0))
+        # Per-slice bits based on 24 bpp and chosen slice_size
+        slice_pixels = float(slice_size * slice_size)
+        slice_data_size_bits = float(slice_pixels * 24.0)
 
-        # Effective totals (include redundancy + per-slice overhead)
-        total_bits_eff = self.current_task.data_size_bits * red + k * header_bits_per_slice
-        total_flops_eff = self.current_task.required_flops * red + k * overhead_flops_per_slice
+        # FLOPs per slice based on empirical table (GFLOPs)
+        flops_table_gflops = {
+            128: 21.73,
+            256: 86.90,
+            512: 347.60,
+            1024: 1390.0,  # 1.39 TFLOPs
+            2048: 5560.0,  
+        }
+        # nearest key
+        nearest_key = min(flops_table_gflops.keys(), key=lambda s: abs(s - slice_size))
+        slice_flops = float(flops_table_gflops[nearest_key]) * 1e9  # convert to FLOPs
 
-        slice_data_size_bits = total_bits_eff / k
-        slice_flops = total_flops_eff / k
+        debug: Dict[str, Any] = {
+            'task_id': self.current_task.id,
+            'width': int(self.current_task.width),
+            'height': int(self.current_task.height),
+            'max_latency_sec': float(self.current_task.max_latency_sec),
+            'k_slices': int(k),
+            'per_slice_bits': float(slice_data_size_bits),
+            'per_slice_flops': float(slice_flops),
+        }
+
+        # Initial hop: source RS -> leader via ISL (send ALL k slices)
+        dist_rs_leader = links.get_distance_km(source_sat.position_ecef, leader_node.position_ecef)
+        isl_cap_rs_leader = links.get_isl_capacity_bps(dist_rs_leader, self.isl_frequency_ghz)
+        t_initial = (k * slice_data_size_bits) / isl_cap_rs_leader if isl_cap_rs_leader > 0 else np.inf
+        debug['source_to_leader'] = {
+            'distance_km': float(dist_rs_leader),
+            'isl_capacity_bps': float(isl_cap_rs_leader),
+            't_initial_sec': float(t_initial),
+        }
+
+        latencies: List[float] = []
+        per_dest: List[Dict[str, Any]] = []
+
+        # Get the nearest compute satellites and ground station for this observation
+        nearest_compute = self._find_nearest_compute_satellites(
+            leader_node.position_ecef,
+            self.num_nearest_compute
+        )
+        nearest_gs = self._find_nearest_ground_station(leader_node.position_ecef)
+
+        # Build destination list: nearest_compute + nearest_gs
+        destinations = nearest_compute + ([nearest_gs] if nearest_gs else [])
+
+        # Process assignment
+        for dest_idx, group in itertools.groupby(sorted(enumerate(assignment[:k]), key=lambda x: x[1]), key=lambda x: x[1]):
+            indices = list(group)
+            num_slices_for_dest = len(indices)
+            entry: Dict[str, Any] = {
+                'dest_index': int(dest_idx),
+                'num_slices': int(num_slices_for_dest),
+            }
+
+            if dest_idx < len(destinations):
+                dest_node = destinations[dest_idx]
+                entry['node_type'] = dest_node.node_type
+                entry['node_compute_gflops'] = float(dest_node.compute_gflops)
+
+                if dest_node.node_type == "GROUND_STATION":
+                    # Downlink to ground station
+                    dist = links.get_distance_km(leader_node.position_ecef, dest_node.position_ecef)
+                    capacity = links.get_downlink_capacity_bps(dist, self.downlink_frequency_ghz)
+                    t_trans = (num_slices_for_dest * slice_data_size_bits) / capacity if capacity > 0 else np.inf
+                    t_comp = (num_slices_for_dest * slice_flops) / (dest_node.compute_gflops * 1e9)
+                    total = t_initial + t_trans + t_comp
+
+                    entry.update({
+                        'distance_km': float(dist),
+                        'downlink_capacity_bps': float(capacity),
+                        't_trans_sec': float(t_trans),
+                        't_comp_sec': float(t_comp),
+                        'path_latency_sec': float(total),
+                    })
+                    latencies.append(total)
+                else:
+                    # ISL to compute satellite (LEO or MEO)
+                    dist_isl = links.get_distance_km(leader_node.position_ecef, dest_node.position_ecef)
+                    isl_capacity = links.get_isl_capacity_bps(dist_isl, self.isl_frequency_ghz)
+                    t_isl = (num_slices_for_dest * slice_data_size_bits) / isl_capacity if isl_capacity > 0 else np.inf
+                    queue_before = dest_node.get_queue_load_flops()
+                    t_queue = queue_before / (dest_node.compute_gflops * 1e9)
+                    t_comp = (num_slices_for_dest * slice_flops) / (dest_node.compute_gflops * 1e9)
+
+                    # Add task to queue (in FLOPs)
+                    task_flops = num_slices_for_dest * slice_flops
+                    dest_node.add_task_slice(self.current_task.id, dest_idx, task_flops,
+                                           self.orbit_propagator.simulation_time.timestamp())
+
+                    total = t_initial + t_isl + t_queue + t_comp
+                    entry.update({
+                        'distance_km': float(dist_isl),
+                        'isl_capacity_bps': float(isl_capacity),
+                        'queue_load_flops_before': float(queue_before),
+                        't_isl_sec': float(t_isl),
+                        't_queue_sec': float(t_queue),
+                        't_comp_sec': float(t_comp),
+                        'path_latency_sec': float(total),
+                    })
+                    latencies.append(total)
+            else:
+                entry['error'] = 'dest_index_out_of_range'
+                latencies.append(np.inf)
+            per_dest.append(entry)
+
+        total_latency_sec = max(latencies) if latencies else 0.0
+
+        # Reward: hard constraint on latency, reward equals mIoU otherwise 0
+        feasible = bool((total_latency_sec > 0) and (not np.isinf(total_latency_sec)) and (total_latency_sec <= float(self.current_task.max_latency_sec)))
+
+        # mIoU from explicit mapping by slice_size (nearest-key fallback)
+        miou_map = {
+            128: 0.40,
+            256: 0.55,
+            512: 0.70,
+            1024: 0.82,
+            2048: 0.90,
+        }
+        nearest_key_m = min(miou_map.keys(), key=lambda s: abs(s - slice_size))
+        xm = float(miou_map[nearest_key_m])
+        xm_source = 'discrete_map'
+
+        reward = float(xm) if feasible else 0.0
+
+        debug.update({
+            'destinations': per_dest,
+            'total_latency_sec': float(total_latency_sec),
+            'max_latency_sec': float(self.current_task.max_latency_sec),
+            'reward': float(reward),
+            'feasible': feasible,
+        })
+        if self.debug_latency:
+            self._last_latency_debug = debug
+
+        return total_latency_sec, reward, xm, feasible, debug
 
         debug: Dict[str, Any] = {
             'task_id': self.current_task.id,
@@ -708,21 +841,27 @@ class SatelliteEnv(gym.Env):
         info['is_valid_step'] = True
         self.valid_steps_taken += 1
         
-        # Parse action
-        slice_size_idx, overlap_ratio_idx = action['slice_strategy']
+        # Parse action (overlap removed; keep backward-compat if provided)
+        ss = action['slice_strategy']
+        if isinstance(ss, (list, tuple, np.ndarray)):
+            ss = list(ss)
+        else:
+            ss = [int(ss)]
+        slice_size_idx = int(ss[0])
         assignment = action['assignment']
         strategy = self.slicing_strategies[slice_size_idx]
         slice_size = strategy['slice_size']
-        overlap_ratio = strategy['overlap_ratios'][overlap_ratio_idx]
-        k = self._calculate_k(slice_size, overlap_ratio)
+        k = self._calculate_k(slice_size)
 
-        # Calculate latency and reward
-        total_latency_sec, aoi_reward = self._calculate_latency_and_reward(k, assignment, slice_size, overlap_ratio)
+        # Calculate latency and reward using new logic
+        total_latency_sec, reward, xm, feasible, debug = self._calculate_latency_and_reward(
+            k, assignment, slice_size, 0.0
+        )
 
-        # Advance simulation time
+        # Advance simulation time by the task latency (or fallback)
         time_to_advance = total_latency_sec
         if np.isinf(total_latency_sec) or total_latency_sec <= 0:
-            time_to_advance = self.sim_config['task_generation'].get('interval_range_sec', [60, 300])[1]
+            time_to_advance = max(float(self.current_task.max_latency_sec), 1.0) if self.current_task else 60.0
 
         self.orbit_propagator.advance_simulation_time(time_to_advance)
         self.orbit_propagator.update_satellite_positions(self.all_satellites)
@@ -741,12 +880,12 @@ class SatelliteEnv(gym.Env):
                         node.update_position(sat.position_ecef)
                         break
 
-        # Generate new tasks
-        new_tasks = self._generate_new_tasks()
+        # Generate next task (fixed-mode: one per step)
+        _ = self._generate_new_tasks()
 
         # Mark current task as completed and fetch next
         processed_task = self.current_task
-        has_next = self._get_next_task()
+        _ = self._get_next_task()
         self.tasks_processed += 1
         if processed_task is not None:
             self.completed_tasks.append(processed_task)
@@ -755,55 +894,25 @@ class SatelliteEnv(gym.Env):
         truncated = self.tasks_processed >= self.max_tasks_per_episode
         terminated = truncated
 
-        # Compute mIoU component and final reward according to mode
-        # mIoU proxy from surrogate or table (monotone by design)
-        if self.use_monotone_surrogate:
-            xm = self._miou_surrogate(slice_size, overlap_ratio)
-            xm_source = 'surrogate'
-        else:
-            xm = self._miou_from_table(slice_size, overlap_ratio)
-            xm_source = 'table'
-
-        max_lat = float(self.current_task.max_latency_sec) if self.current_task else 0.0
-        violation = max(0.0, (total_latency_sec - max_lat) / max(max_lat, 1e-6)) if max_lat > 0 else 0.0
-        feasible = bool((total_latency_sec > 0) and (not np.isinf(total_latency_sec)) and (total_latency_sec <= max_lat))
-
-        mode = self.reward_mode
-        reward = 0.0
-        if mode == 'miou_hard_constraint':
-            if feasible:
-                latency_bonus = self.epsilon_latency_bonus * max(0.0, 1.0 - total_latency_sec / max_lat) if max_lat > 0 else 0.0
-                reward = float(xm + latency_bonus)
-            else:
-                reward = 0.0
-        elif mode == 'miou_soft_penalty':
-            reward = float(xm - self.penalty_lambda * violation)
-        elif mode == 'voi_multiplicative':
-            if feasible:
-                reward = float((xm ** self.voi_beta) * aoi_reward)
-            else:
-                reward = 0.0
-        else:
-            # default back to AoI only
-            reward = float(aoi_reward)
-
         obs = self._get_obs()
         info.update({
-            'total_latency': total_latency_sec,
-            'chosen_slice_size': slice_size,
-            'chosen_overlap_ratio': overlap_ratio,
-            'calculated_k': k,
-            'tasks_processed': self.tasks_processed,
-            'valid_steps_taken': self.valid_steps_taken,
-            'aoi': float(aoi_reward),
+            'total_latency': float(total_latency_sec),
+            'chosen_slice_size': int(slice_size),
+            
+            'calculated_k': int(k),
+            'tasks_processed': int(self.tasks_processed),
+            'valid_steps_taken': int(self.valid_steps_taken),
             'miou': float(xm),
-            'xm_source': xm_source,
-            'violation_ratio': float(violation),
-            'feasible': feasible,
-            'reward_mode': mode,
+            'feasible': bool(feasible),
+            'reward_mode': 'miou_hard_constraint',
+            'reward': float(reward),
+            'latency_debug': debug if self.debug_latency else None,
+            'assignment': [int(x) for x in assignment[:k]],
+            'leader_node_id': int(self.current_leader_satellite.node_id) if self.current_leader_satellite else -1,
+            'sim_time': self.orbit_propagator.simulation_time.isoformat() + 'Z',
         })
 
-        return obs, reward, terminated, truncated, info
+        return obs, float(reward), bool(terminated), bool(truncated), info
 
     def render(self, mode='human'):
         if mode == 'human':

@@ -19,10 +19,14 @@ ground_station:
   generation_method: "hex_grid"
   grid_radius_km: 220.60
   # Default compute capacity for each auto-generated ground station
-  compute_gflops: 1000.0
+  compute_gflops: 14000.0
 
 # Task Generation parameters
 task_generation:
+  fixed_mode: true
+  fixed_size: [6000, 6000]
+  fixed_bits_per_pixel: 24
+  fixed_max_latency_sec_range: [60, 150]
   image_size_range: [1024, 4096] # Min/max image width/height in pixels
   bands_range: [3, 8]            # Min/max number of spectral bands
   interval_range_sec: [60, 300]  # A new task is generated every 1-5 minutes
@@ -64,15 +68,10 @@ model_performance:
 # Defines the available options for the 'slice_strategy' action
 slicing_strategies:
   - slice_size: 128
-    overlap_ratios: [0, 0.1, 0.15, 0.25, 0.5]
   - slice_size: 256
-    overlap_ratios: [0, 0.1, 0.15, 0.25, 0.5]
   - slice_size: 512
-    overlap_ratios: [0, 0.1, 0.15, 0.25, 0.5]
   - slice_size: 1024
-    overlap_ratios: [0, 0.1, 0.15, 0.25, 0.5]
   - slice_size: 2048
-    overlap_ratios: [0, 0.1, 0.15, 0.25, 0.5]
 
 # Target area for remote sensing tasks and UE generation
 target_area:

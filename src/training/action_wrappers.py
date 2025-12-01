@@ -34,13 +34,21 @@ class FlattenedDictActionWrapper(gym.Wrapper):
         assert isinstance(slice_space, spaces.MultiDiscrete)
         assert isinstance(assign_space, spaces.MultiDiscrete)
 
-        self._ns = int(slice_space.nvec[0])
-        self._no = int(slice_space.nvec[1])
+        nvec = list(map(int, slice_space.nvec.tolist()))
+        if len(nvec) == 1:
+            self._ns = nvec[0]
+            self._no = 0
+            self._slice_dims = 1
+        else:
+            self._ns = nvec[0]
+            self._no = nvec[1]
+            self._slice_dims = 2
         self._mk = int(len(assign_space.nvec))
         self._nd = int(assign_space.nvec[0]) if self._mk > 0 else 0
 
-        # New flattened MultiDiscrete: [ns, no] + [nd]*mk
-        self.action_space = spaces.MultiDiscrete(np.array([self._ns, self._no] + [self._nd] * self._mk, dtype=np.int64))
+        # New flattened MultiDiscrete: [ns] (+[no] if present) + [nd]*mk
+        base = [self._ns] if self._slice_dims == 1 else [self._ns, self._no]
+        self.action_space = spaces.MultiDiscrete(np.array(base + [self._nd] * self._mk, dtype=np.int64))
         # Observation space unchanged
         self.observation_space = env.observation_space
 
@@ -48,9 +56,14 @@ class FlattenedDictActionWrapper(gym.Wrapper):
         """Convert flat action to the Dict expected by the inner env."""
         if isinstance(action, (list, tuple)):
             action = np.array(action, dtype=np.int64)
-        assert action.shape[0] == 2 + self._mk, "Flat action has unexpected length"
-        slice_strategy = action[:2]
-        assignment = action[2:]
+        expected = (1 if self._slice_dims == 1 else 2) + self._mk
+        assert action.shape[0] == expected, f"Flat action has unexpected length: {action.shape[0]} != {expected}"
+        if self._slice_dims == 1:
+            slice_strategy = action[:1]
+            assignment = action[1:]
+        else:
+            slice_strategy = action[:2]
+            assignment = action[2:]
         return {
             'slice_strategy': slice_strategy.astype(np.int64),
             'assignment': assignment.astype(np.int64)

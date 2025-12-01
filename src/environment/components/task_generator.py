@@ -71,19 +71,26 @@ class Task:
 
 class TaskGenerator:
     """
-    Generates unified tasks for satellites with Poisson arrivals per satellite.
+    Generates tasks. Supports two modes:
+    - Poisson arrival mode (legacy)
+    - Fixed-per-step generation with fixed size/bpp/latency (new, for simpler training)
     """
 
     def __init__(self, task_config: Dict[str, Any], area_config: Dict[str, Any], flops_per_pixel: float):
         self.task_config = task_config
-        self.area_config = area_config  # kept for compatibility; not used in Poisson arrivals by default
+        self.area_config = area_config
         self.flops_per_pixel = float(flops_per_pixel)
         self._rng = np.random.default_rng()
         self._next_task_id = 0
 
-        # Determine Poisson arrival rate (per second)
+        # Fixed-mode parameters (defaults per user requirement)
+        self.fixed_size = tuple(task_config.get('fixed_size', (6000, 6000)))
+        self.fixed_bits_per_pixel = int(task_config.get('fixed_bits_per_pixel', 24))
+        self.fixed_max_latency_range = tuple(task_config.get('fixed_max_latency_sec_range', (50.0, 200.0)))
+        self.fixed_mode = bool(task_config.get('fixed_mode', True))
+
+        # Poisson arrival parameters (legacy mode)
         self.poisson_rate_per_sec = self._determine_rate(task_config)
-        # State: per-satellite next arrival time
         self._next_arrival_time_by_sat: Dict[int, datetime] = {}
 
     # -----------------------------
@@ -131,24 +138,45 @@ class TaskGenerator:
     # Public API
     # -----------------------------
     def reset_arrivals(self, sim_time: datetime, satellites: List['Satellite']):
-        """Initialize next arrival time for each satellite from sim_time."""
+        """Initialize next arrival time for each satellite from sim_time.
+        In fixed_mode, arrivals are generated per call, so we just reset counters.
+        """
         self._next_arrival_time_by_sat.clear()
-        for sat in satellites:
-            self._next_arrival_time_by_sat[sat.id] = sim_time + self._next_interarrival()
+        # nothing else required in fixed mode
 
     def generate_unified_tasks(self, satellites: List['Satellite'], sim_time: datetime) -> List[Task]:
         """
-        Generate tasks up to the current simulation time according to per-satellite
-        Poisson processes. Multiple tasks may be generated per satellite if the
-        simulation time advances by a large amount.
+        Generate tasks. In fixed_mode, generate exactly one task per provided
+        satellite at this call, with fixed size/bpp and a latency sampled from
+        fixed_max_latency_sec_range. In legacy mode, fall back to Poisson arrival
+        generation up to sim_time.
         """
         new_tasks: List[Task] = []
+        if self.fixed_mode:
+            for sat in satellites:
+                w, h = int(self.fixed_size[0]), int(self.fixed_size[1])
+                lat_lo, lat_hi = float(self.fixed_max_latency_range[0]), float(self.fixed_max_latency_range[1])
+                max_lat = float(self._rng.uniform(lat_lo, lat_hi))
+                data_bits = int(w * h * self.fixed_bits_per_pixel)
+                # required_flops kept for compatibility but unused in new latency logic
+                flops = float(w * h * self.flops_per_pixel)
+                task = Task(
+                    task_id=self._next_task_id,
+                    width=w,
+                    height=h,
+                    max_latency_sec=max_lat,
+                    data_size_bits=data_bits,
+                    required_flops=flops,
+                    origin=sat,
+                )
+                self._next_task_id += 1
+                new_tasks.append(task)
+            return new_tasks
+
+        # Legacy Poisson mode
         for sat in satellites:
-            # Initialize next arrival lazily if needed
             if sat.id not in self._next_arrival_time_by_sat:
                 self._next_arrival_time_by_sat[sat.id] = sim_time + self._next_interarrival()
-
-            # Generate all arrivals that occurred up to sim_time
             while self._next_arrival_time_by_sat[sat.id] <= sim_time:
                 w, h = self._sample_size()
                 max_lat = self._sample_max_latency()
@@ -165,8 +193,5 @@ class TaskGenerator:
                 )
                 self._next_task_id += 1
                 new_tasks.append(task)
-
-                # Schedule next arrival for this satellite
                 self._next_arrival_time_by_sat[sat.id] += self._next_interarrival()
-
         return new_tasks
