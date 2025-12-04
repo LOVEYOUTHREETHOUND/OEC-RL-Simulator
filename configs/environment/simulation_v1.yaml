@@ -1,7 +1,7 @@
 # Basic simulation configuration for the SatelliteEnv
 
 # --- Simulation Time ---
-start_time: '2024-01-01T00:00:00Z'
+start_time: '2023-01-01T00:00:00Z'
 
 # --- Hierarchical Learning Parameters ---
 # Defines the hierarchical slicing strategies for the meta-controller

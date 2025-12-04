@@ -44,6 +44,13 @@ def parse_args():
     p.add_argument("--ent_coef", type=float, default=0.01)
     p.add_argument("--override_max_tasks_per_episode", type=int, default=None)
     p.add_argument("--fast_preset", action="store_true", help="Use faster/more responsive settings for clearer convergence curves")
+    # Evaluation / checkpoint / early-stop knobs
+    p.add_argument("--eval_freq_steps", type=int, default=50_000, help="Eval frequency in env calls (VecEnv calls).")
+    p.add_argument("--save_ckpt_every_steps_env", type=int, default=100_000, help="Checkpoint frequency in effective env timesteps. Will be divided by n_envs to get callback calls.")
+    p.add_argument("--early_stop", action="store_true", help="Enable early stopping based on eval mean reward.")
+    p.add_argument("--early_stop_patience_evals", type=int, default=10, help="Number of consecutive non-improving evals to stop training.")
+    p.add_argument("--early_stop_min_delta", type=float, default=0.0, help="Absolute improvement required to count as better.")
+    p.add_argument("--early_stop_min_delta_rel", type=float, default=0.01, help="Relative improvement (fraction of best) required to count as better.")
     return p.parse_args()
 
 
@@ -121,13 +128,25 @@ def main():
         device="cuda",
     )
 
+    # Two-column episode reward TXT alongside TB dir
+    episode_reward_txt = os.path.join(os.path.dirname(paths["tb"]), "by_episode_reward.txt")
+
     # Callbacks
+    # scale checkpoint call-frequency by n_envs so that effective timesteps ~= save_ckpt_every_steps_env
+    ckpt_calls = max(int(args.save_ckpt_every_steps_env // max(1, args.n_envs)), 1)
     callbacks = build_callbacks(eval_env=eval_env,
                                 models_dir=paths["models"],
                                 evals_dir=paths["evals"],
                                 best_model_name="best_model",
-                                save_freq_steps=10000,
+                                save_freq_steps=ckpt_calls,
                                 train_logs_dir=paths["train_logs"],
+                                train_plain_logs_dir=paths["train_plain_logs"],
+                                episode_reward_txt_path=episode_reward_txt,
+                                eval_freq_steps=args.eval_freq_steps,
+                                early_stop=bool(args.early_stop),
+                                early_stop_patience_evals=args.early_stop_patience_evals,
+                                early_stop_min_delta=args.early_stop_min_delta,
+                                early_stop_min_delta_rel=args.early_stop_min_delta_rel,
                                 log_rotate_every_episodes=100)
 
     # Train

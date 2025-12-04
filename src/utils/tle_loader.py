@@ -59,7 +59,7 @@ def get_tle_data(norad_id: int, cache_dir: str, cache_duration_hours: int = 24) 
     if REQUESTS_AVAILABLE:
         url = f"https://celestrak.org/NORAD/elements/gp.php?CATNR={norad_id}&FORMAT=tle"
         try:
-            resp = requests.get(url, timeout=30, verify=False)
+            resp = requests.get(url, timeout=30, verify=True)
             resp.raise_for_status()
             text = resp.text.strip()
             if text and "No TLE found" not in text:
@@ -113,7 +113,7 @@ def _fetch_group_text(group: str, groups_cache_dir: str, cache_hours: int = 24) 
     if not url:
         return None
     try:
-        resp = requests.get(url, timeout=60, verify=False)
+        resp = requests.get(url, timeout=60, verify=True)
         resp.raise_for_status()
         text = resp.text
         with open(cache_file, 'w', encoding='utf-8') as f:

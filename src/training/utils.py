@@ -227,13 +227,40 @@ class StepRewardMovingAverageCallback(BaseCallback):
 
 class EpisodeRewardCallback(BaseCallback):
     """Log episode reward using episode index as the TensorBoard step.
-    This gives a clear view of reward vs episode progression.
+    Also compute per-episode feasible rate (= feasible_steps / episode_steps)
+    and append a three-column line "<episode_idx> <episode_reward> <feasible_rate>" to a txt file.
     """
-    def __init__(self, log_ep_length: bool = True, prefix: str = 'by_episode', verbose: int = 0):
+    def __init__(self, log_ep_length: bool = True, prefix: str = 'by_episode', txt_file_path: str | None = None, verbose: int = 0):
         super().__init__(verbose)
         self.log_ep_length = log_ep_length
         self.prefix = prefix
         self.episode_idx = 0
+        self.txt_file_path = txt_file_path
+        self._txt_file = None
+        # Per-env counters for feasible rate
+        self._n_envs: int | None = None
+        self._feasible_counts: list[int] | None = None
+        self._step_counts: list[int] | None = None
+        if self.txt_file_path:
+            try:
+                os.makedirs(os.path.dirname(self.txt_file_path), exist_ok=True)
+                # append mode: keep history if continuing the same run
+                self._txt_file = open(self.txt_file_path, 'a', encoding='utf-8')
+            except Exception:
+                self._txt_file = None
+
+    def _on_training_start(self) -> None:
+        # Initialize per-env counters
+        try:
+            env = getattr(self, 'training_env', None) or getattr(self.model, 'env', None)
+            if env is not None and hasattr(env, 'num_envs'):
+                self._n_envs = int(env.num_envs)
+            else:
+                self._n_envs = 1
+        except Exception:
+            self._n_envs = 1
+        self._feasible_counts = [0 for _ in range(self._n_envs)]
+        self._step_counts = [0 for _ in range(self._n_envs)]
 
     def _on_step(self) -> bool:
         infos = None
@@ -242,21 +269,120 @@ class EpisodeRewardCallback(BaseCallback):
         except Exception:
             infos = None
         if infos is not None:
-            for info in infos:
+            # Accumulate per-env feasible/step counts
+            for i, info in enumerate(infos):
+                if self._feasible_counts is not None and self._step_counts is not None:
+                    # step count +1 for this env index
+                    if i < len(self._step_counts):
+                        self._step_counts[i] += 1
+                        # feasible flag
+                        try:
+                            if isinstance(info, dict) and bool(info.get('feasible', False)):
+                                self._feasible_counts[i] += 1
+                        except Exception:
+                            pass
+                # Episode termination for this env
                 ep_info = info.get('episode') if isinstance(info, dict) else None
                 if ep_info is not None:
                     self.episode_idx += 1
                     r = float(ep_info.get('r', 0.0))
+                    l = float(ep_info.get('l', 0.0)) if self.log_ep_length else 0.0
+                    # Compute feasible rate for this env
+                    feasible_rate = 0.0
+                    if self._feasible_counts is not None and self._step_counts is not None and i < len(self._step_counts):
+                        steps = max(1, self._step_counts[i])
+                        feasible_rate = float(self._feasible_counts[i]) / float(steps)
+                        # reset counters for this env
+                        self._feasible_counts[i] = 0
+                        self._step_counts[i] = 0
+                    # Log to TB
                     self.logger.record(f'{self.prefix}/episode_reward', r)
                     if self.log_ep_length:
-                        l = float(ep_info.get('l', 0.0))
                         self.logger.record(f'{self.prefix}/episode_length', l)
+                    self.logger.record(f'{self.prefix}/feasible_rate', feasible_rate)
                     # dump with episode index as x-axis
                     if hasattr(self.logger, 'dump'):
                         try:
                             self.logger.dump(self.episode_idx)
                         except Exception:
                             pass
+                    # optionally write txt line: "episode reward feasible_rate"
+                    if self._txt_file is not None:
+                        try:
+                            self._txt_file.write(f"{self.episode_idx} {r} {feasible_rate}\n")
+                            self._txt_file.flush()
+                        except Exception:
+                            pass
+        return True
+
+    def _on_training_end(self) -> None:
+        try:
+            if self._txt_file is not None:
+                self._txt_file.flush()
+                self._txt_file.close()
+        except Exception:
+            pass
+
+
+class EarlyStopOnEvalReward(BaseCallback):
+    """Early stop when eval mean reward does not improve for N evals.
+
+    Args:
+        eval_cb: the EvalCallback instance to read results from
+        patience_evals: stop after this many consecutive non-improving evals
+        min_delta: absolute minimum improvement to count as better
+        min_delta_rel: relative improvement (fraction of best) to count as better
+    """
+    def __init__(self, eval_cb: EvalCallback, patience_evals: int = 10,
+                 min_delta: float = 0.0, min_delta_rel: float = 0.01, verbose: int = 1):
+        super().__init__(verbose)
+        self.eval_cb = eval_cb
+        self.patience = max(1, int(patience_evals))
+        self.min_delta = float(min_delta)
+        self.min_delta_rel = float(min_delta_rel)
+        self.no_improve = 0
+        self._last_seen_eval_calls = 0
+        self._best = -np.inf
+
+    def _on_training_start(self) -> None:
+        try:
+            self._best = float(getattr(self.eval_cb, "best_mean_reward", -np.inf))
+            self._last_seen_eval_calls = int(getattr(self.eval_cb, "n_eval_calls", 0))
+        except Exception:
+            pass
+
+    def _on_step(self) -> bool:
+        # Only act right after a new eval has been performed
+        try:
+            n_calls = int(getattr(self.eval_cb, "n_eval_calls", 0))
+        except Exception:
+            return True
+        if n_calls == self._last_seen_eval_calls:
+            return True
+        self._last_seen_eval_calls = n_calls
+
+        last = getattr(self.eval_cb, "last_mean_reward", None)
+        if last is None:
+            return True
+        last = float(last)
+        best = float(self._best)
+
+        improved = (last > best + self.min_delta) or (
+            (best > -np.inf) and ((last - best) > abs(best) * self.min_delta_rel)
+        )
+        if improved:
+            self._best = last
+            self.no_improve = 0
+            if self.verbose:
+                print(f"[EarlyStop] New best eval mean_reward={last:.4f}")
+        else:
+            self.no_improve += 1
+            if self.verbose:
+                print(f"[EarlyStop] No improvement ({self.no_improve}/{self.patience}) last={last:.4f}, best={best:.4f}")
+            if self.no_improve >= self.patience:
+                if self.verbose:
+                    print("[EarlyStop] Patience exhausted. Stopping training.")
+                return False
         return True
 
 
@@ -572,17 +698,18 @@ def _build_single_env(sim_config_path: str,
         except Exception:
             pass
         # Monitor for episode stats
-        if monitor_log_dir:
-            os.makedirs(monitor_log_dir, exist_ok=True)
-            env = Monitor(env, filename=None, info_keywords=(
-                "total_latency",
-                "calculated_k",
-                "miou",
-                "feasible",
-                "reward_mode",
-                "chosen_slice_size",
-                "reward"
-            ))
+        # Always wrap with Monitor to ensure EvalCallback works correctly.
+        # Only log to file if a directory is provided.
+        log_path = os.path.join(monitor_log_dir, f"monitor_{seed}.csv") if monitor_log_dir else None
+        env = Monitor(env, filename=log_path, info_keywords=(
+            "total_latency",
+            "calculated_k",
+            "miou",
+            "feasible",
+            "reward_mode",
+            "chosen_slice_size",
+            "reward"
+        ))
         # Seed
         env.reset(seed=seed)
         return env
@@ -670,6 +797,14 @@ def build_callbacks(eval_env,
                     step_ma_log_every: int = 200,
                     enable_episode_reward: bool = True,
                     episode_log_prefix: str = 'by_episode',
+                    episode_reward_txt_path: Optional[str] = None,
+                    # evaluation frequency in env steps (calls)
+                    eval_freq_steps: int = 10_000,
+                    # early stop knobs
+                    early_stop: bool = False,
+                    early_stop_patience_evals: int = 10,
+                    early_stop_min_delta: float = 0.0,
+                    early_stop_min_delta_rel: float = 0.01,
                     enable_episode_feasible: bool = True,
                     train_logs_dir: Optional[str] = None,
                     train_plain_logs_dir: Optional[str] = None,
@@ -704,6 +839,17 @@ def build_callbacks(eval_env,
     if info_keys:
         cbs.append(InfoScalarCallback(keys=info_keys, log_every=info_log_every, verbose=1))
 
+    # Early stopping based on EvalCallback results
+    if early_stop:
+        try:
+            cbs.append(EarlyStopOnEvalReward(eval_cb,
+                                             patience_evals=early_stop_patience_evals,
+                                             min_delta=early_stop_min_delta,
+                                             min_delta_rel=early_stop_min_delta_rel,
+                                             verbose=1))
+        except Exception:
+            pass
+
     # Step-wise reward moving average (does not wait for episode end)
     if enable_step_reward_ma:
         cbs.append(StepRewardMovingAverageCallback(window_size=step_ma_window,
@@ -712,7 +858,9 @@ def build_callbacks(eval_env,
 
     # Episode-wise reward using episode index as x-axis
     if enable_episode_reward:
-        cbs.append(EpisodeRewardCallback(prefix=episode_log_prefix, verbose=0))
+        cbs.append(EpisodeRewardCallback(prefix=episode_log_prefix,
+                                         txt_file_path=episode_reward_txt_path,
+                                         verbose=0))
 
     # JSONL training logger
     if train_logs_dir:

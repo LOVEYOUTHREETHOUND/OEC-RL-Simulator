@@ -565,11 +565,15 @@ class SatelliteEnv(gym.Env):
         # Initial hop: source RS -> leader via ISL (send ALL k slices)
         dist_rs_leader = links.get_distance_km(source_sat.position_ecef, leader_node.position_ecef)
         isl_cap_rs_leader = links.get_isl_capacity_bps(dist_rs_leader, self.isl_frequency_ghz)
-        t_initial = (k * slice_data_size_bits) / isl_cap_rs_leader if isl_cap_rs_leader > 0 else np.inf
+        t_initial_tx = (k * slice_data_size_bits) / isl_cap_rs_leader if isl_cap_rs_leader > 0 else np.inf
+        t_initial_prop = (dist_rs_leader * 1000.0) / constants.SPEED_OF_LIGHT_M_S
+        t_initial = t_initial_tx + t_initial_prop
         debug['source_to_leader'] = {
             'distance_km': float(dist_rs_leader),
             'isl_capacity_bps': float(isl_cap_rs_leader),
-            't_initial_sec': float(t_initial),
+            't_initial_sec': float(t_initial),           # tx + propagation
+            't_initial_tx_sec': float(t_initial_tx),     # tx only (for diagnostics)
+            't_prop_sec': float(t_initial_prop),
         }
 
         latencies: List[float] = []
@@ -603,14 +607,18 @@ class SatelliteEnv(gym.Env):
                     # Downlink to ground station
                     dist = links.get_distance_km(leader_node.position_ecef, dest_node.position_ecef)
                     capacity = links.get_downlink_capacity_bps(dist, self.downlink_frequency_ghz)
-                    t_trans = (num_slices_for_dest * slice_data_size_bits) / capacity if capacity > 0 else np.inf
+                    t_down_tx = (num_slices_for_dest * slice_data_size_bits) / capacity if capacity > 0 else np.inf
+                    t_down_prop = (dist * 1000.0) / constants.SPEED_OF_LIGHT_M_S
+                    t_trans = t_down_tx + t_down_prop
                     t_comp = (num_slices_for_dest * slice_flops) / (dest_node.compute_gflops * 1e9)
                     total = t_initial + t_trans + t_comp
 
                     entry.update({
                         'distance_km': float(dist),
                         'downlink_capacity_bps': float(capacity),
-                        't_trans_sec': float(t_trans),
+                        't_trans_sec': float(t_trans),            # tx + propagation
+                        't_trans_tx_sec': float(t_down_tx),       # tx only
+                        't_prop_sec': float(t_down_prop),
                         't_comp_sec': float(t_comp),
                         'path_latency_sec': float(total),
                     })
@@ -619,7 +627,9 @@ class SatelliteEnv(gym.Env):
                     # ISL to compute satellite (LEO or MEO)
                     dist_isl = links.get_distance_km(leader_node.position_ecef, dest_node.position_ecef)
                     isl_capacity = links.get_isl_capacity_bps(dist_isl, self.isl_frequency_ghz)
-                    t_isl = (num_slices_for_dest * slice_data_size_bits) / isl_capacity if isl_capacity > 0 else np.inf
+                    t_isl_tx = (num_slices_for_dest * slice_data_size_bits) / isl_capacity if isl_capacity > 0 else np.inf
+                    t_isl_prop = (dist_isl * 1000.0) / constants.SPEED_OF_LIGHT_M_S
+                    t_isl = t_isl_tx + t_isl_prop
                     queue_before = dest_node.get_queue_load_flops()
                     t_queue = queue_before / (dest_node.compute_gflops * 1e9)
                     t_comp = (num_slices_for_dest * slice_flops) / (dest_node.compute_gflops * 1e9)
@@ -634,7 +644,9 @@ class SatelliteEnv(gym.Env):
                         'distance_km': float(dist_isl),
                         'isl_capacity_bps': float(isl_capacity),
                         'queue_load_flops_before': float(queue_before),
-                        't_isl_sec': float(t_isl),
+                        't_isl_sec': float(t_isl),               # tx + propagation
+                        't_isl_tx_sec': float(t_isl_tx),         # tx only
+                        't_prop_sec': float(t_isl_prop),
                         't_queue_sec': float(t_queue),
                         't_comp_sec': float(t_comp),
                         'path_latency_sec': float(total),
@@ -652,11 +664,11 @@ class SatelliteEnv(gym.Env):
 
         # mIoU from explicit mapping by slice_size (nearest-key fallback)
         miou_map = {
-            128: 0.40,
-            256: 0.55,
+            128: 0.60,
+            256: 0.65,
             512: 0.70,
-            1024: 0.82,
-            2048: 0.90,
+            1024: 0.76,
+            2048: 0.82,
         }
         nearest_key_m = min(miou_map.keys(), key=lambda s: abs(s - slice_size))
         xm = float(miou_map[nearest_key_m])
@@ -674,7 +686,7 @@ class SatelliteEnv(gym.Env):
         if self.debug_latency:
             self._last_latency_debug = debug
 
-        return total_latency_sec, reward, xm, feasible, debug
+        # return total_latency_sec, reward, xm, feasible, debug
 
         debug: Dict[str, Any] = {
             'task_id': self.current_task.id,
@@ -771,23 +783,32 @@ class SatelliteEnv(gym.Env):
 
         total_latency_sec = max(latencies) if latencies else 0.0
         
-        # Reward: enforce max latency constraint
-        if total_latency_sec > self.current_task.max_latency_sec or np.isinf(total_latency_sec) or total_latency_sec < 0:
-            reward = 0.0
-        else:
-            aoi = np.exp(-constants.AOI_DECAY_RATE_LAMBDA * total_latency_sec)
-            reward = float(aoi)
+        # Feasibility and mIoU-hard-constraint reward
+        feasible = bool((total_latency_sec > 0) and (not np.isinf(total_latency_sec)) and (total_latency_sec <= float(self.current_task.max_latency_sec)))
+
+        miou_map = {
+            128: 0.40,
+            256: 0.55,
+            512: 0.70,
+            1024: 0.82,
+            2048: 0.90,
+        }
+        nearest_key_m = min(miou_map.keys(), key=lambda s: abs(s - slice_size))
+        xm = float(miou_map[nearest_key_m])
+
+        reward = float(xm) if feasible else 0.0
         
         debug.update({
             'destinations': per_dest,
             'total_latency_sec': float(total_latency_sec),
             'max_latency_sec': float(self.current_task.max_latency_sec),
             'reward': float(reward),
+            'feasible': bool(feasible),
         })
         if self.debug_latency:
             self._last_latency_debug = debug
 
-        return total_latency_sec, reward
+        return total_latency_sec, float(reward), float(xm), bool(feasible), debug
 
     def step(self, action: Dict[str, np.ndarray]) -> Tuple[Dict[str, np.ndarray], float, bool, bool, Dict[str, Any]]:
         """

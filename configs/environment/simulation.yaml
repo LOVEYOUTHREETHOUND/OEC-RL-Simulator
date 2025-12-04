@@ -26,7 +26,7 @@ task_generation:
   fixed_mode: true
   fixed_size: [6000, 6000]
   fixed_bits_per_pixel: 24
-  fixed_max_latency_sec_range: [60, 150]
+  fixed_max_latency_sec_range: [110, 250]
   image_size_range: [1024, 4096] # Min/max image width/height in pixels
   bands_range: [3, 8]            # Min/max number of spectral bands
   interval_range_sec: [60, 300]  # A new task is generated every 1-5 minutes
