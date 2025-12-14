@@ -141,7 +141,8 @@ def get_downlink_capacity_bps(distance_km: float, frequency_ghz: float) -> float
     - Apply CNR lower-bound (MIN_DOWNLINK_CNR_DB)
     - Apply capacity floor (MIN_DOWNLINK_CAPACITY_BPS)
     """
-    base_cnr_db = 50.0  # baseline CNR before path loss and environment
+    # Reduce baseline CNR to make ground links less ideal (slightly relaxed from previous)
+    base_cnr_db = 44.0  # baseline CNR before path loss and environment
     fspl_db = constants.FSPL_BASE_LOSS_DB + 20 * np.log10(max(distance_km, 1e-3)) + 20 * np.log10(max(frequency_ghz, 1e-6))
     rician_loss_db = _get_downlink_rician_loss_db()
 
@@ -152,7 +153,12 @@ def get_downlink_capacity_bps(distance_km: float, frequency_ghz: float) -> float
         cnr_db = max(cnr_db, constants.MIN_DOWNLINK_CNR_DB)
 
     cnr_linear = db_to_linear(cnr_db)
-    bandwidth_hz = 0.01 * (frequency_ghz * 1e9)
+    # Downlink bandwidth ratio is configurable; smaller ratio -> weaker link
+    if hasattr(constants, "DOWNLINK_BANDWIDTH_TO_FREQUENCY_RATIO"):
+        bw_ratio = constants.DOWNLINK_BANDWIDTH_TO_FREQUENCY_RATIO
+    else:
+        bw_ratio = 0.01
+    bandwidth_hz = bw_ratio * (frequency_ghz * 1e9)
     capacity_bps = bandwidth_hz * np.log2(1 + cnr_linear)
 
     # Apply capacity floor for RL stability

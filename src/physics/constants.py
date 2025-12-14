@@ -32,7 +32,8 @@ FSPL_BASE_LOSS_DB = 92.45
 # --- Satellite-to-Ground Link (Downlink) Constants ---
 
 # Environmental attenuation loss in dB. Assumed constant as per the spec.
-DOWNLINK_ENV_LOSS_DB = 8.0  # Slightly reduced to improve availability
+# Slightly relaxed to avoid over-penalizing ground links.
+DOWNLINK_ENV_LOSS_DB = 12.0
 
 # Rician factor for the small-scale fading model
 DOWNLINK_RICIAN_FACTOR_K = 12.0  # Strong LoS component
@@ -40,6 +41,9 @@ DOWNLINK_RICIAN_FACTOR_K = 12.0  # Strong LoS component
 # Minimum Carrier-to-Noise Ratio (CNR) threshold for successful demodulation in dB
 # Note: The link model will no longer hard-zero capacity below this; instead we use soft floors.
 DOWNLINK_CNR_THRESHOLD_DB = 0.0
+
+# Downlink bandwidth as a fraction of carrier frequency (tune to make ground link weaker/stronger)
+DOWNLINK_BANDWIDTH_TO_FREQUENCY_RATIO = 0.004
 
 # --- Inter-Satellite Link (ISL) Constants ---
 
