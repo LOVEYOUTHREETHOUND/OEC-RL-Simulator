@@ -115,7 +115,7 @@ def _constant_action(env, first_idx: int, assign_idx: int = 0) -> np.ndarray:
 
 def local_only_policy(env):
     """
-    "本地"基线改为把任务分摊到前三个可用计算卫星（不含地面站），
+    “本地”基线改为把任务分摊到前三个可用计算卫星（不含地面站），
     使用最小 slice_size（index 0），分配维度轮询 0/1/2。
     """
     nvec = np.array(env.action_space.nvec, dtype=np.int64)
@@ -139,7 +139,7 @@ def ground_only_policy(env):
 
 def load_balanced_policy(env):
     """
-    简单的"负载均衡"基线：slice_strategy 取最小（index 0），assignment 在可用 compute 节点间循环。
+    简单的“负载均衡”基线：slice_strategy 取最小（index 0），assignment 在可用 compute 节点间循环。
     """
     nvec = np.array(env.action_space.nvec, dtype=np.int64)
     first_idx = 0
@@ -153,30 +153,6 @@ def load_balanced_policy(env):
         # 假设 ground 是最后一个 dest，所以轮询只到 num_compute-1
         act[1:] = rr
     return act
-
-
-def _plot_panel(ax, xs, ys, ylabel, title, curves, jittered_latency=None):
-    """通用的绘图函数，用于在给定的坐标轴上绘制一个子图"""
-    for name, cfg in curves.items():
-        y_data = jittered_latency[name] if jittered_latency else cfg["ys_reward"]
-        ax.plot(
-            xs,
-            y_data,
-            label=name,
-            color=cfg["color"],
-            marker=cfg["marker"],
-            linestyle=cfg["ls"],
-            linewidth=1.5,
-            markersize=6,
-            markerfacecolor="none",
-            markeredgewidth=1.1,
-        )
-    ax.set_xlabel("Number of tasks")
-    ax.set_ylabel(ylabel)
-    ax.set_title(title, fontsize=11, y=-0.25)
-    ax.grid(True, alpha=0.25)
-    ax.tick_params(direction="in")
-    ax.legend(framealpha=0.9, fontsize=9)
 
 
 def main():
@@ -272,54 +248,43 @@ def main():
         env.close()
         print(f"[Eval] Point {i+1} done.\n", flush=True)
 
-    # 生成抖动后的延迟数据
+    # Plot side-by-side subplots: left = reward, right = total latency
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4), sharex=False)
+
+    # Add small random jitter to latency points to visually separate lines
     rng = np.random.default_rng(1234)
     jittered_latency = {
         k: [max(y + rng.uniform(-50.0, 50.0), 0.0) for y in v["ys_latency"]]
         for k, v in curves.items()
     }
 
-    # 1. 创建并保存并排子图
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4), sharex=False)
-    
-    # 绘制奖励子图
-    _plot_panel(axes[0], xs, {k: v["ys_reward"] for k, v in curves.items()}, 
-                "Total Reward", "(a) Reward performance", curves)
-    
-    # 绘制延迟子图
-    _plot_panel(axes[1], xs, jittered_latency, 
-                "Total latency (s)", "(b) Total latency performance", curves, jittered_latency)
-    
+    def _plot_panel(ax, ys, ylabel, title):
+        for name, cfg in curves.items():
+            ax.plot(
+                xs,
+                ys[name],
+                label=name,
+                color=cfg["color"],
+                marker=cfg["marker"],
+                linestyle=cfg["ls"],
+                linewidth=1.5,
+                markersize=6,
+                markerfacecolor="none",
+                markeredgewidth=1.1,
+            )
+        ax.set_xlabel("Number of tasks" if task_counts else "Eval batches")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title, fontsize=11, y=-0.25)
+        ax.grid(True, alpha=0.25)
+        ax.tick_params(direction="in")
+        ax.legend(framealpha=0.9, fontsize=9)
+
+    _plot_panel(axes[0], {k: v["ys_reward"] for k, v in curves.items()}, "Total Reward", "(a) Reward performance")
+    _plot_panel(axes[1], jittered_latency, "Total latency (s)", "(b) Total latency performance")
+
     plt.tight_layout()
     fig.savefig(args.out, dpi=300, bbox_inches="tight")
-    print(f"Saved combined figure to {args.out}")
-    
-    # 2. 单独保存奖励子图
-    fig_reward, ax_reward = plt.subplots(figsize=(5, 4))
-    _plot_panel(ax_reward, xs, {k: v["ys_reward"] for k, v in curves.items()}, 
-                "Total Reward", "(a) Reward performance", curves)
-    plt.tight_layout()
-    
-    # 生成单独保存的文件名
-    base_name, ext = os.path.splitext(args.out)
-    reward_out = f"{base_name}_reward{ext}"
-    fig_reward.savefig(reward_out, dpi=300, bbox_inches="tight")
-    print(f"Saved reward subfigure to {reward_out}")
-    plt.close(fig_reward)
-    
-    # 3. 单独保存延迟子图
-    fig_latency, ax_latency = plt.subplots(figsize=(5, 4))
-    _plot_panel(ax_latency, xs, jittered_latency, 
-                "Total latency (s)", "(b) Total latency performance", curves, jittered_latency)
-    plt.tight_layout()
-    
-    latency_out = f"{base_name}_latency{ext}"
-    fig_latency.savefig(latency_out, dpi=300, bbox_inches="tight")
-    print(f"Saved latency subfigure to {latency_out}")
-    plt.close(fig_latency)
-    
-    # 关闭并排子图的图形
-    plt.close(fig)
+    print(f"Saved to {args.out}")
 
 
 if __name__ == "__main__":
