@@ -126,6 +126,13 @@ class ObservationScaler(gym.ObservationWrapper):
         return scaled, reward, terminated, truncated, info
 
 from src.training.action_wrappers import FlattenedDictActionWrapper
+# HRL wrappers (optional)
+try:
+    from src.training.hrl_wrappers import MacroController, MacroFlatOverrideWrapper, GoalInjectionObsWrapper
+except Exception:
+    MacroController = None
+    MacroFlatOverrideWrapper = None
+    GoalInjectionObsWrapper = None
 
 
 
@@ -228,7 +235,9 @@ class StepRewardMovingAverageCallback(BaseCallback):
 class EpisodeRewardCallback(BaseCallback):
     """Log episode reward using episode index as the TensorBoard step.
     Also compute per-episode feasible rate (= feasible_steps / episode_steps)
-    and append a three-column line "<episode_idx> <episode_reward> <feasible_rate>" to a txt file.
+    and append multiple columns to a txt file for comprehensive tracking.
+    
+    TXT file format: episode reward feasible_rate success_rate mean_miou mean_latency episode_length
     """
     def __init__(self, log_ep_length: bool = True, prefix: str = 'by_episode', txt_file_path: str | None = None, verbose: int = 0):
         super().__init__(verbose)
@@ -241,11 +250,24 @@ class EpisodeRewardCallback(BaseCallback):
         self._n_envs: int | None = None
         self._feasible_counts: list[int] | None = None
         self._step_counts: list[int] | None = None
+        # Per-env accumulators for episode statistics
+        self._success_counts: list[int] | None = None
+        self._miou_sums: list[float] | None = None
+        self._latency_sums: list[float] | None = None
+        self._miou_counts: list[int] | None = None
+        self._latency_counts: list[int] | None = None
+        # HRL manager-specific accumulators (optional)
+        self._feasible_inwin_sums: list[int] | None = None
+        self._macro_h_sums: list[int] | None = None
         if self.txt_file_path:
             try:
                 os.makedirs(os.path.dirname(self.txt_file_path), exist_ok=True)
                 # append mode: keep history if continuing the same run
                 self._txt_file = open(self.txt_file_path, 'a', encoding='utf-8')
+                # Write header if file is new/empty
+                if os.path.getsize(self.txt_file_path) == 0:
+                    self._txt_file.write("# episode reward feasible_rate success_rate mean_miou mean_latency episode_length\n")
+                    self._txt_file.flush()
             except Exception:
                 self._txt_file = None
 
@@ -261,6 +283,11 @@ class EpisodeRewardCallback(BaseCallback):
             self._n_envs = 1
         self._feasible_counts = [0 for _ in range(self._n_envs)]
         self._step_counts = [0 for _ in range(self._n_envs)]
+        self._success_counts = [0 for _ in range(self._n_envs)]
+        self._miou_sums = [0.0 for _ in range(self._n_envs)]
+        self._latency_sums = [0.0 for _ in range(self._n_envs)]
+        self._miou_counts = [0 for _ in range(self._n_envs)]
+        self._latency_counts = [0 for _ in range(self._n_envs)]
 
     def _on_step(self) -> bool:
         infos = None
@@ -269,53 +296,226 @@ class EpisodeRewardCallback(BaseCallback):
         except Exception:
             infos = None
         if infos is not None:
-            # Accumulate per-env feasible/step counts
+            # Accumulate per-env feasible/step counts and other metrics
             for i, info in enumerate(infos):
-                if self._feasible_counts is not None and self._step_counts is not None:
+                if isinstance(info, dict) and i < self._n_envs:
                     # step count +1 for this env index
-                    if i < len(self._step_counts):
+                    if self._step_counts is not None and i < len(self._step_counts):
                         self._step_counts[i] += 1
-                        # feasible flag
-                        try:
-                            if isinstance(info, dict) and bool(info.get('feasible', False)):
+                    
+                    # feasible flag or ratio
+                    try:
+                        if self._feasible_counts is not None:
+                            if 'feasible_ratio' in info:
+                                self._feasible_counts[i] += float(info.get('feasible_ratio', 0.0))
+                            elif bool(info.get('feasible', False)):
                                 self._feasible_counts[i] += 1
-                        except Exception:
-                            pass
+                            # success count kept for compatibility with boolean feasible
+                            if self._success_counts is not None and bool(info.get('feasible', False)):
+                                self._success_counts[i] += 1
+                    except Exception:
+                        pass
+                    
+                    # Accumulate mIoU
+                    try:
+                        miou = info.get('miou', None)
+                        if miou is not None and self._miou_sums is not None and self._miou_counts is not None:
+                            self._miou_sums[i] += float(miou)
+                            self._miou_counts[i] += 1
+                    except Exception:
+                        pass
+                    
+                    # Accumulate total latency
+                    try:
+                        latency = info.get('total_latency', None)
+                        if latency is not None and self._latency_sums is not None and self._latency_counts is not None:
+                            self._latency_sums[i] += float(latency)
+                            self._latency_counts[i] += 1
+                    except Exception:
+                        pass
+                
                 # Episode termination for this env
                 ep_info = info.get('episode') if isinstance(info, dict) else None
                 if ep_info is not None:
                     self.episode_idx += 1
                     r = float(ep_info.get('r', 0.0))
                     l = float(ep_info.get('l', 0.0)) if self.log_ep_length else 0.0
-                    # Compute feasible rate for this env
+                    
+                    # Compute episode statistics for this env
                     feasible_rate = 0.0
-                    if self._feasible_counts is not None and self._step_counts is not None and i < len(self._step_counts):
-                        steps = max(1, self._step_counts[i])
-                        feasible_rate = float(self._feasible_counts[i]) / float(steps)
-                        # reset counters for this env
-                        self._feasible_counts[i] = 0
-                        self._step_counts[i] = 0
-                    # Log to TB
+                    success_rate = 0.0
+                    mean_miou = 0.0
+                    mean_latency = 0.0
+                    
+                    if i < self._n_envs:
+                        # Feasible rate
+                        if self._feasible_counts is not None and self._step_counts is not None:
+                            steps = max(1, self._step_counts[i])
+                            feasible_rate = float(self._feasible_counts[i]) / float(steps)
+                        
+                        # Success rate
+                        if self._success_counts is not None and self._step_counts is not None:
+                            steps = max(1, self._step_counts[i])
+                            success_rate = float(self._success_counts[i]) / float(steps)
+                        
+                        # Mean mIoU
+                        if self._miou_sums is not None and self._miou_counts is not None:
+                            if self._miou_counts[i] > 0:
+                                mean_miou = self._miou_sums[i] / self._miou_counts[i]
+                        
+                        # Mean latency
+                        if self._latency_sums is not None and self._latency_counts is not None:
+                            if self._latency_counts[i] > 0:
+                                mean_latency = self._latency_sums[i] / self._latency_counts[i]
+                        
+                        # Reset counters for this env
+                        if self._feasible_counts is not None:
+                            self._feasible_counts[i] = 0
+                        if self._step_counts is not None:
+                            self._step_counts[i] = 0
+                        if self._success_counts is not None:
+                            self._success_counts[i] = 0
+                        if self._miou_sums is not None:
+                            self._miou_sums[i] = 0.0
+                        if self._latency_sums is not None:
+                            self._latency_sums[i] = 0.0
+                        if self._miou_counts is not None:
+                            self._miou_counts[i] = 0
+                        if self._latency_counts is not None:
+                            self._latency_counts[i] = 0
+                    
+                    # Log to TensorBoard
                     self.logger.record(f'{self.prefix}/episode_reward', r)
                     if self.log_ep_length:
                         self.logger.record(f'{self.prefix}/episode_length', l)
                     self.logger.record(f'{self.prefix}/feasible_rate', feasible_rate)
+                    self.logger.record(f'{self.prefix}/success_rate', success_rate)
+                    self.logger.record(f'{self.prefix}/mean_miou', mean_miou)
+                    self.logger.record(f'{self.prefix}/mean_latency', mean_latency)
+                    
                     # dump with episode index as x-axis
                     if hasattr(self.logger, 'dump'):
                         try:
                             self.logger.dump(self.episode_idx)
                         except Exception:
                             pass
-                    # optionally write txt line: "episode reward feasible_rate"
+                    
+                    # Write to txt file: episode reward feasible_rate success_rate mean_miou mean_latency episode_length
                     if self._txt_file is not None:
                         try:
-                            self._txt_file.write(f"{self.episode_idx} {r} {feasible_rate}\n")
+                            self._txt_file.write(f"{self.episode_idx} {r:.6f} {feasible_rate:.6f} {success_rate:.6f} {mean_miou:.6f} {mean_latency:.6f} {int(l)}\n")
                             self._txt_file.flush()
                         except Exception:
                             pass
         return True
 
     def _on_training_end(self) -> None:
+        try:
+            if self._txt_file is not None:
+                self._txt_file.flush()
+                self._txt_file.close()
+        except Exception:
+            pass
+
+
+class A2CTrainingMetricsCallback(BaseCallback):
+    """Log A2C-specific training metrics to TensorBoard and optionally to a txt file.
+    
+    Records policy loss, value loss, entropy loss, explained variance,
+    learning rate, and other A2C-specific metrics that are crucial for
+    monitoring convergence.
+    
+    Note: SB3's A2C already logs these to TensorBoard under 'train/*' prefix.
+    This callback provides additional functionality:
+    1. Logs to a separate txt file for easy analysis
+    2. Creates duplicate metrics under 'a2c/*' prefix for better organization
+    """
+    def __init__(self, log_every: int = 100, txt_file_path: str | None = None, tb_prefix: str = 'a2c', verbose: int = 0):
+        super().__init__(verbose)
+        self.log_every = int(max(1, log_every))
+        self._last_log_step = 0
+        self.txt_file_path = txt_file_path
+        self._txt_file = None
+        self.tb_prefix = str(tb_prefix)
+        
+        # Track metrics for txt logging
+        self._metrics_buffer = []
+        
+        if self.txt_file_path:
+            try:
+                os.makedirs(os.path.dirname(self.txt_file_path), exist_ok=True)
+                self._txt_file = open(self.txt_file_path, 'a', encoding='utf-8')
+                # Write header if file is new/empty
+                if os.path.getsize(self.txt_file_path) == 0:
+                    self._txt_file.write("# timesteps n_updates policy_loss value_loss entropy_loss explained_variance learning_rate total_loss\n")
+                    self._txt_file.flush()
+            except Exception as e:
+                if self.verbose > 0:
+                    print(f"[A2CTrainingMetricsCallback] Failed to open txt file: {e}")
+                self._txt_file = None
+
+    def _on_step(self) -> bool:
+        # Note: SB3's A2C logs metrics after each rollout (every n_steps), not every env step
+        # We check if new metrics are available in the logger
+        return True
+
+    def _on_rollout_end(self) -> None:
+        """Called after each rollout (every n_steps). This is when A2C updates and logs metrics."""
+        try:
+            # Access the logger's name_to_value dict which contains recently logged metrics
+            if hasattr(self.model, 'logger') and self.model.logger is not None:
+                logger = self.model.logger
+                
+                if hasattr(logger, 'name_to_value') and len(logger.name_to_value) > 0:
+                    name_to_value = logger.name_to_value
+                    
+                    # Extract A2C metrics
+                    metrics = {
+                        'timesteps': self.num_timesteps,
+                        'n_updates': name_to_value.get('train/n_updates', None),
+                        'policy_loss': name_to_value.get('train/policy_loss', None),
+                        'value_loss': name_to_value.get('train/value_loss', None),
+                        'entropy_loss': name_to_value.get('train/entropy_loss', None),
+                        'explained_variance': name_to_value.get('train/explained_variance', None),
+                        'learning_rate': name_to_value.get('train/learning_rate', None),
+                        'total_loss': name_to_value.get('train/loss', None),
+                    }
+                    
+                    # Log to TensorBoard under custom prefix for better organization (e.g., worker/* or manager/*)
+                    for key, value in metrics.items():
+                        if value is not None and key != 'timesteps':
+                            self.logger.record(f'{self.tb_prefix}/{key}', float(value))
+                    
+                    # Write to txt file
+                    if self._txt_file is not None:
+                        try:
+                            line_parts = []
+                            for key in ['timesteps', 'n_updates', 'policy_loss', 'value_loss', 
+                                       'entropy_loss', 'explained_variance', 'learning_rate', 'total_loss']:
+                                val = metrics.get(key, None)
+                                if val is not None:
+                                    if key == 'timesteps' or key == 'n_updates':
+                                        line_parts.append(f"{int(val)}")
+                                    else:
+                                        line_parts.append(f"{float(val):.6f}")
+                                else:
+                                    line_parts.append("NA")
+                            
+                            self._txt_file.write(" ".join(line_parts) + "\n")
+                            self._txt_file.flush()
+                        except Exception as e:
+                            if self.verbose > 0:
+                                print(f"[A2CTrainingMetricsCallback] Error writing to txt: {e}")
+                    
+                    if self.verbose > 0:
+                        print(f"[A2CTrainingMetricsCallback] Logged metrics at timestep {self.num_timesteps}")
+                        
+        except Exception as e:
+            if self.verbose > 0:
+                print(f"[A2CTrainingMetricsCallback] Error in _on_rollout_end: {e}")
+
+    def _on_training_end(self) -> None:
+        """Close txt file when training ends."""
         try:
             if self._txt_file is not None:
                 self._txt_file.flush()
@@ -808,7 +1008,12 @@ def build_callbacks(eval_env,
                     enable_episode_feasible: bool = True,
                     train_logs_dir: Optional[str] = None,
                     train_plain_logs_dir: Optional[str] = None,
-                    log_rotate_every_episodes: int = 100) -> List:
+                    log_rotate_every_episodes: int = 100,
+                    # A2C-specific metrics
+                    enable_a2c_metrics: bool = True,
+                    a2c_metrics_log_every: int = 100,
+                    a2c_metrics_txt_path: Optional[str] = None,
+                    a2c_tb_prefix: str = 'a2c') -> List:
     """Create standard callbacks: Eval, periodic Checkpoint, and optional InfoScalar logging.
 
     Args:
@@ -862,11 +1067,12 @@ def build_callbacks(eval_env,
                                          txt_file_path=episode_reward_txt_path,
                                          verbose=0))
 
-    # JSONL training logger
-    if train_logs_dir:
-        cbs.append(TrainingJSONLoggerCallback(logs_dir=train_logs_dir,
-                                              rotate_every_episodes=log_rotate_every_episodes,
-                                              verbose=0))
+    # A2C training metrics
+    if enable_a2c_metrics:
+        cbs.append(A2CTrainingMetricsCallback(log_every=a2c_metrics_log_every, 
+                                              txt_file_path=a2c_metrics_txt_path,
+                                              tb_prefix=a2c_tb_prefix,
+                                              verbose=1))
 
     # JSONL training logger
     if train_logs_dir:
