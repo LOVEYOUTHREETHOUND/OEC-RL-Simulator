@@ -12,6 +12,14 @@ except Exception:  # pragma: no cover - fallback if scipy not installed
     savgol_filter = None
 
 
+def set_square(ax):
+    """Force the plotting area to be square regardless of data ranges."""
+    try:
+        ax.set_box_aspect(1)
+    except Exception:
+        # Fallback for older Matplotlib
+        ax.set_aspect('equal', adjustable='box')
+
 def smooth_series(series, window, polyorder, fallback_rolling=201):
     """Apply Savitzky-Golay smoothing if possible; otherwise use rolling mean."""
     if savgol_filter is not None:
@@ -33,6 +41,15 @@ def smooth_series(series, window, polyorder, fallback_rolling=201):
 def main():
     # Global font
     rcParams["font.family"] = "Times New Roman"
+    # Increase global font sizes for readability
+    rcParams.update({
+        "font.size": 16,
+        "axes.titlesize": 16,
+        "axes.labelsize": 16,
+        "xtick.labelsize": 14,
+        "ytick.labelsize": 14,
+        "legend.fontsize": 13,
+    })
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--log", required=True, help="Path to by_episode_reward.txt")
@@ -64,11 +81,11 @@ def main():
     reward_color = "#D8383A"
     feasible_color = "#14517C"
 
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4), sharex=False)
+    fig, axes = plt.subplots(1, 2, figsize=(8, 8), sharex=False)
 
     # Left: Reward
     ax = axes[0]
-    ax.plot(df["ep"], df["reward_smooth"], color=reward_color, lw=1.0, label="Reward")
+    ax.plot(df["ep"], df["reward_smooth"], color=reward_color, lw=1.6, label="Reward")
     ax.set_xlabel("Episodes")
     ax.set_ylabel("Reward")
     ax.set_ylim(42, 50)
@@ -78,12 +95,11 @@ def main():
     formatter = plt.ScalarFormatter(useMathText=True)
     formatter.set_powerlimits((4, 4))
     ax.xaxis.set_major_formatter(formatter)
-    ax.text(0.5, -0.16, "(a) Reward", transform=ax.transAxes, ha="center", va="center", fontsize=11)
-    ax.legend(loc="lower right", fontsize=9, framealpha=0.9)
+    
 
     # Right: Feasible rate
     ax = axes[1]
-    ax.plot(df["ep"], df["feasible_smooth_scaled"], color=feasible_color, lw=1.0, label="Feasible")
+    ax.plot(df["ep"], df["feasible_smooth_scaled"], color=feasible_color, lw=1.6, label="Feasible")
     ax.set_xlabel("Episodes")
     ax.set_ylabel("Feasible rate")
     ax.set_ylim(0.60, 0.85)
@@ -93,12 +109,58 @@ def main():
     formatter2 = plt.ScalarFormatter(useMathText=True)
     formatter2.set_powerlimits((4, 4))
     ax.xaxis.set_major_formatter(formatter2)
-    ax.text(0.5, -0.16, "(b) Feasible rate", transform=ax.transAxes, ha="center", va="center", fontsize=11)
     ax.legend(loc="lower right", fontsize=9, framealpha=0.9)
 
     plt.tight_layout()
     plt.savefig(args.out, dpi=300, bbox_inches="tight")
     print(f"Saved to {args.out}")
+
+    # 另外分别输出两张子图（无下方标题）
+    base_name, ext = os.path.splitext(args.out)
+
+    # 单独保存奖励子图
+    fig_r, ax_r = plt.subplots(figsize=(5, 4))
+    ax_r.plot(df["ep"], df["reward_smooth"], color=reward_color, lw=1.0, label="Reward")
+    ax_r.set_xlabel("Episodes")
+    ax_r.set_ylabel("Reward")
+    ax_r.set_ylim(42, 50)
+    ax_r.set_xlim(left=0, right=35_000)
+    ax_r.grid(True, alpha=0.25)
+    ax_r.tick_params(direction="in")
+    fmt_r = plt.ScalarFormatter(useMathText=True)
+    fmt_r.set_powerlimits((4, 4))
+    ax_r.xaxis.set_major_formatter(fmt_r)
+    # ax_r.legend(loc="lower right", fontsize=9, framealpha=0.9)
+    plt.tight_layout()
+    out_r = f"{base_name}_reward{ext}"
+    fig_r.savefig(out_r, dpi=300, bbox_inches="tight")
+    # Also save SVG
+    out_r_svg = f"{base_name}_reward.svg"
+    fig_r.savefig(out_r_svg, format="svg", bbox_inches="tight")
+    print(f"Saved reward subfigure to {out_r} and {out_r_svg}")
+    plt.close(fig_r)
+
+    # 单独保存可行率子图
+    fig_f, ax_f = plt.subplots(figsize=(5, 4))
+    ax_f.plot(df["ep"], df["feasible_smooth_scaled"], color=feasible_color, lw=1.0, label="Feasible")
+    ax_f.set_xlabel("Episodes")
+    ax_f.set_ylabel("Feasible rate")
+    ax_f.set_ylim(0.60, 0.85)
+    ax_f.set_xlim(left=0, right=35_000)
+    ax_f.grid(True, alpha=0.25)
+    ax_f.tick_params(direction="in")
+    fmt_f = plt.ScalarFormatter(useMathText=True)
+    fmt_f.set_powerlimits((4, 4))
+    ax_f.xaxis.set_major_formatter(fmt_f)
+    # ax_f.legend(loc="lower right", fontsize=9, framealpha=0.9)
+    plt.tight_layout()
+    out_f = f"{base_name}_feasible{ext}"
+    fig_f.savefig(out_f, dpi=300, bbox_inches="tight")
+    # Also save SVG
+    out_f_svg = f"{base_name}_feasible.svg"
+    fig_f.savefig(out_f_svg, format="svg", bbox_inches="tight")
+    print(f"Saved feasible subfigure to {out_f} and {out_f_svg}")
+    plt.close(fig_f)
 
 
 if __name__ == "__main__":

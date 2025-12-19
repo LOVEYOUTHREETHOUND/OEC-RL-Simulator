@@ -168,6 +168,7 @@ class SatelliteEnv(gym.Env):
         self.tasks_processed = 0  # Number of tasks processed in this episode
         self.steps_taken = 0  # Total steps (including invalid steps)
         self.valid_steps_taken = 0  # Valid steps only
+        self.successful_tasks_count = 0  # Number of tasks that met latency constraint
 
         # Debug / diagnostics
         self.debug_latency: bool = bool(sim_config.get('debug_latency', True))
@@ -471,6 +472,7 @@ class SatelliteEnv(gym.Env):
         self.steps_taken = 0
         self.valid_steps_taken = 0
         self.tasks_processed = 0
+        self.successful_tasks_count = 0
         self.task_queue.clear()
         self.completed_tasks.clear()
 
@@ -911,6 +913,10 @@ class SatelliteEnv(gym.Env):
         if processed_task is not None:
             self.completed_tasks.append(processed_task)
 
+        # Track success count
+        if bool(feasible):
+            self.successful_tasks_count += 1
+
         # Check termination
         truncated = self.tasks_processed >= self.max_tasks_per_episode
         terminated = truncated
@@ -923,6 +929,7 @@ class SatelliteEnv(gym.Env):
             'calculated_k': int(k),
             'tasks_processed': int(self.tasks_processed),
             'valid_steps_taken': int(self.valid_steps_taken),
+            'successful_tasks_count': int(self.successful_tasks_count),
             'miou': float(xm),
             'feasible': bool(feasible),
             'reward_mode': 'miou_hard_constraint',
