@@ -20,10 +20,14 @@ from __future__ import annotations
 import os
 import sys
 import argparse
-from typing import Callable, Dict, Any, Optional
+import re
+from datetime import datetime
+from typing import Callable, Dict, Any, Optional, Tuple
 
-# Mitigate CUDA fragmentation
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+import torch
+
+# Mitigate CUDA fragmentation (Windows 不支持 expandable_segments，关闭并设置更保守参数)
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:False,garbage_collection_threshold:0.8,max_split_size_mb:64")
 
 import numpy as np
 
@@ -31,6 +35,29 @@ from stable_baselines3 import A2C
 from stable_baselines3.common.utils import set_random_seed
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.callbacks import BaseCallback, CallbackList
+
+
+def _ensure_callbacklist(cb):
+    """Normalize and flatten into a CallbackList with only BaseCallback items."""
+    def _flatten(seq):
+        out = []
+        for c in seq:
+            if isinstance(c, CallbackList):
+                out.extend(_flatten(c.callbacks))
+            elif isinstance(c, list):
+                out.extend(_flatten(c))
+            elif isinstance(c, BaseCallback):
+                out.append(c)
+        return out
+
+    if isinstance(cb, CallbackList):
+        return CallbackList(_flatten(cb.callbacks))
+    if isinstance(cb, BaseCallback):
+        return CallbackList([cb])
+    if isinstance(cb, list):
+        return CallbackList(_flatten(cb))
+    return CallbackList([])
 
 # Ensure project root on path
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -55,6 +82,125 @@ from src.training.hrl_wrappers import (
 from src.utils.config_loader import load_config
 from src.utils.tle_loader import preprocess_satellite_configs
 from src.environment.satellite_env import SatelliteEnv
+
+
+def _resolve_device(dev_arg: str) -> str:
+    dev_arg = (dev_arg or "cuda").strip().lower()
+    try:
+        if dev_arg.startswith("cuda"):
+            m = re.match(r"cuda(?::(\d+))?$", dev_arg)
+            idx = int(m.group(1)) if (m and m.group(1) is not None) else 0
+            if not torch.cuda.is_available() or idx >= torch.cuda.device_count():
+                print(f"[Warn] CUDA unavailable or invalid index '{dev_arg}', fallback to CPU.", file=sys.stderr, flush=True)
+                return "cpu"
+            return f"cuda:{idx}"
+        if dev_arg in ("cpu", "auto"):
+            if dev_arg == "auto" and torch.cuda.is_available():
+                return "cuda:0"
+            return "cpu"
+    except Exception as e:
+        print(f"[Warn] Device resolve error for '{dev_arg}': {e}, fallback to CPU.", file=sys.stderr, flush=True)
+    return "cpu"
+
+
+class CudaMemLogger(BaseCallback):
+    """Periodically prints CUDA memory usage/peak. Works even if CPU fallback (no-op)."""
+    def __init__(self, tag: str, device_str: str, every_steps: int = 0):
+        super().__init__()
+        self.tag = tag
+        self.device_str = device_str
+        self.every_steps = int(every_steps)
+        self._last_print = 0
+
+    def _on_training_start(self) -> None:
+        if torch.cuda.is_available() and self.device_str.startswith("cuda"):
+            try:
+                torch.cuda.reset_peak_memory_stats()
+            except Exception:
+                pass
+
+    def _print_now(self) -> None:
+        if torch.cuda.is_available() and self.device_str.startswith("cuda"):
+            try:
+                alloc = torch.cuda.memory_allocated() / (1024**2)
+                reserved = torch.cuda.memory_reserved() / (1024**2)
+                peak = torch.cuda.max_memory_allocated() / (1024**2)
+                print(f"[{datetime.utcnow().isoformat()}Z][MEM][{self.tag}] steps={self.num_timesteps} alloc={alloc:.1f}MB reserved={reserved:.1f}MB peak={peak:.1f}MB device={self.device_str}", flush=True)
+            except Exception:
+                pass
+
+    def _on_rollout_end(self) -> None:
+        self._print_now()
+
+    def _on_step(self) -> bool:
+        if self.every_steps > 0 and (self.num_timesteps - self._last_print) >= self.every_steps:
+            self._print_now()
+            self._last_print = self.num_timesteps
+        return True
+
+
+class AdvantageLogger(BaseCallback):
+    """Log advantage mean/std to TensorBoard and a txt file after each rollout."""
+    def __init__(self, tag: str, txt_path: Optional[str] = None):
+        super().__init__()
+        self.tag = tag
+        self.txt_path = txt_path
+        self._fh = None
+
+    def _ensure_file(self):
+        if self.txt_path and self._fh is None:
+            os.makedirs(os.path.dirname(self.txt_path), exist_ok=True)
+            new_file = not os.path.exists(self.txt_path)
+            self._fh = open(self.txt_path, "a", encoding="utf-8")
+            if new_file:
+                self._fh.write("steps\tadv_mean\tadv_std\n")
+                self._fh.flush()
+
+    def _on_rollout_end(self) -> None:
+        rb = getattr(self.model, "rollout_buffer", None)
+        if rb is None:
+            return
+        adv = getattr(rb, "advantages", None)
+        if adv is None:
+            # fallback: returns - values
+            returns = getattr(rb, "returns", None)
+            values = getattr(rb, "values", None)
+            if returns is not None and values is not None:
+                try:
+                    adv = returns - values
+                except Exception:
+                    adv = None
+        if adv is None:
+            return
+        try:
+            adv_np = adv.detach().cpu().float().numpy().reshape(-1)
+        except Exception:
+            return
+        if adv_np.size == 0:
+            return
+        mean = float(np.mean(adv_np))
+        std = float(np.std(adv_np))
+        # TensorBoard
+        try:
+            self.logger.record(f"{self.tag}/advantage_mean", mean)
+            self.logger.record(f"{self.tag}/advantage_std", std)
+        except Exception:
+            pass
+        # TXT
+        try:
+            self._ensure_file()
+            if self._fh is not None:
+                self._fh.write(f"{self.num_timesteps}\t{mean:.6f}\t{std:.6f}\n")
+                self._fh.flush()
+        except Exception:
+            pass
+
+    def _on_training_end(self) -> None:
+        if self._fh is not None:
+            try:
+                self._fh.close()
+            except Exception:
+                pass
 
 
 def parse_args():
@@ -155,6 +301,10 @@ def main():
     args = parse_args()
     set_random_seed(args.seed)
 
+    # Resolve device with safe fallback
+    device_str = _resolve_device(getattr(args, "device", "cuda"))
+    print(f"[Device] Using device: {device_str}", flush=True)
+
     # Prepare dirs
     paths = prepare_run_dirs(algo="a2c_hrl", run_name=args.run_name)
     save_run_metadata(paths["meta"], {
@@ -220,7 +370,7 @@ def main():
         seed=args.seed,
         verbose=1,
         tensorboard_log=paths["tb"],
-        device=args.device,
+        device=device_str,
         policy_kwargs=dict(
             features_extractor_class=NodeTransformerExtractor,
             features_extractor_kwargs=dict(
@@ -252,6 +402,7 @@ def main():
     os.makedirs(worker_evals_dir, exist_ok=True)
     worker_episode_txt = os.path.join(os.path.dirname(paths["tb"]), "worker_by_episode.txt")
     worker_metrics_txt = os.path.join(os.path.dirname(paths["tb"]), "worker_a2c_metrics.txt")
+    worker_adv_txt = os.path.join(os.path.dirname(paths["tb"]), "worker_advantage.txt")
     worker_callbacks = build_callbacks(
         eval_env=eval_worker_env,
         models_dir=worker_models_dir,
@@ -266,6 +417,15 @@ def main():
         a2c_tb_prefix='worker',
         log_rotate_every_episodes=100,
     )
+    # 规范化为 CallbackList 并附加显存与优势日志回调
+    worker_callbacks = _ensure_callbacklist(worker_callbacks)
+    try:
+        mem_cb_worker = CudaMemLogger(tag='worker', device_str=device_str, every_steps=args.worker_n_envs * args.worker_n_steps)
+        adv_cb_worker = AdvantageLogger(tag='worker', txt_path=worker_adv_txt)
+        worker_callbacks.callbacks.append(mem_cb_worker)
+        worker_callbacks.callbacks.append(adv_cb_worker)
+    except Exception:
+        pass
 
     # Train Worker
     worker.learn(total_timesteps=args.worker_total_timesteps, callback=worker_callbacks, progress_bar=True)
@@ -347,7 +507,7 @@ def main():
         seed=args.seed + 42,
         verbose=1,
         tensorboard_log=paths["tb"],
-        device=args.device,
+        device=device_str,
         policy_kwargs=dict(
             features_extractor_class=NodeTransformerExtractor,
             features_extractor_kwargs=dict(
@@ -381,6 +541,16 @@ def main():
         a2c_tb_prefix='manager',
         log_rotate_every_episodes=100,
     )
+    # 规范化为 CallbackList 并附加显存与优势日志回调
+    manager_callbacks = _ensure_callbacklist(manager_callbacks)
+    try:
+        manager_adv_txt = os.path.join(os.path.dirname(paths["tb"]), "manager_advantage.txt")
+        mem_cb_manager = CudaMemLogger(tag='manager', device_str=device_str, every_steps=args.manager_n_steps)
+        adv_cb_manager = AdvantageLogger(tag='manager', txt_path=manager_adv_txt)
+        manager_callbacks.callbacks.append(mem_cb_manager)
+        manager_callbacks.callbacks.append(adv_cb_manager)
+    except Exception:
+        pass
 
     # Train Manager
     # Important: Manager sets controller.set_macro(); Worker acts deterministically inside its window.

@@ -62,6 +62,8 @@ def parse_args():
     p.add_argument("--early_stop_patience_evals", type=int, default=10, help="Number of consecutive non-improving evals to stop training.")
     p.add_argument("--early_stop_min_delta", type=float, default=0.0, help="Absolute improvement required to count as better.")
     p.add_argument("--early_stop_min_delta_rel", type=float, default=0.01, help="Relative improvement (fraction of best) required to count as better.")
+    # Add a flag to switch between Transformer and a simpler baseline extractor
+    p.add_argument("--use_transformer", action="store_true", help="Use the NodeTransformerExtractor instead of the default FlattenExtractor.")
     return p.parse_args()
 
 
@@ -123,7 +125,24 @@ def main():
         override_max_tasks_per_episode=args.override_max_tasks_per_episode,
     )
 
-    # Model (minimal change: plug custom features extractor)
+    # --------------------------------------------------------------------
+    # Model definition: switch feature extractor based on --use_transformer
+    # --------------------------------------------------------------------
+    if args.use_transformer:
+        policy_kwargs = dict(
+            features_extractor_class=NodeTransformerExtractor,
+            features_extractor_kwargs=dict(
+                d_model=args.d_model,
+                nhead=args.nhead,
+                num_layers=args.num_layers,
+                dropout=0.1,
+                pool="mean",
+            ),
+        )
+    else:
+        # Use default FlattenExtractor (no need to specify) as baseline
+        policy_kwargs = {}
+
     model = A2C(
         policy="MultiInputPolicy",
         env=train_env,
@@ -137,16 +156,7 @@ def main():
         verbose=1,
         tensorboard_log=paths["tb"],
         device="cuda",
-        policy_kwargs=dict(
-            features_extractor_class=NodeTransformerExtractor,
-            features_extractor_kwargs=dict(
-                d_model=args.d_model,
-                nhead=args.nhead,
-                num_layers=args.num_layers,
-                dropout=0.1,
-                pool="mean",
-            ),
-        ),
+        policy_kwargs=policy_kwargs,
     )
 
     # TXT files for episode and A2C metrics alongside TB dir
