@@ -841,11 +841,16 @@ class SatelliteEnv(gym.Env):
         self.current_leader_satellite = self._find_nearest_visible_leader(self.current_source_satellite)
         
         if not self.current_leader_satellite:
-            # No visible leader - skip this step (invalid)
-            info['reason'] = 'No visible MEO leader'
+            # No visible leader - skip current task and move to next
+            _ = self._get_next_task()
+            self.tasks_processed += 1
+            info['reason'] = 'No visible MEO leader (task skipped)'
             info['is_valid_step'] = False
             obs = self._get_obs()
-            return obs, 0.0, False, False, info
+            # Check termination
+            truncated = self.tasks_processed >= self.max_tasks_per_episode
+            terminated = truncated
+            return obs, 0.0, terminated, truncated, info
         
         # Check if we have enough compute satellites
         nearest_compute = self._find_nearest_compute_satellites(
@@ -854,11 +859,16 @@ class SatelliteEnv(gym.Env):
         )
         
         if len(nearest_compute) < self.num_nearest_compute:
-            # Not enough compute satellites - skip this step (invalid)
-            info['reason'] = f'Only {len(nearest_compute)} compute satellites visible (need {self.num_nearest_compute})'
+            # Not enough compute satellites - skip current task and move to next
+            _ = self._get_next_task()
+            self.tasks_processed += 1
+            info['reason'] = f'Only {len(nearest_compute)} compute satellites visible (need {self.num_nearest_compute}) (task skipped)'
             info['is_valid_step'] = False
             obs = self._get_obs()
-            return obs, 0.0, False, False, info
+            # Check termination
+            truncated = self.tasks_processed >= self.max_tasks_per_episode
+            terminated = truncated
+            return obs, 0.0, terminated, truncated, info
         
         # Valid step - process the action
         info['is_valid_step'] = True

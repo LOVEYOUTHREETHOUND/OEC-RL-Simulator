@@ -295,6 +295,7 @@ class EpisodeRewardCallback(BaseCallback):
             infos = self.locals.get('infos', None)
         except Exception:
             infos = None
+        ended_stats = []  # collect stats for all envs that ended this global step
         if infos is not None:
             # Accumulate per-env feasible/step counts and other metrics
             for i, info in enumerate(infos):
@@ -342,30 +343,22 @@ class EpisodeRewardCallback(BaseCallback):
                     l = float(ep_info.get('l', 0.0)) if self.log_ep_length else 0.0
                     
                     # Compute episode statistics for this env
-                    feasible_rate = 0.0
-                    success_rate = 0.0
-                    mean_miou = 0.0
-                    mean_latency = 0.0
+                    # Prefer metrics directly provided by ep_info (if available)
+                    feasible_rate = float(ep_info.get('feasible_rate', 0.0))
+                    success_rate = float(ep_info.get('success_rate', 0.0))
+                    mean_miou = float(ep_info.get('mean_miou', 0.0))
+                    mean_latency = float(ep_info.get('mean_latency', 0.0))
                     
-                    if i < self._n_envs:
-                        # Feasible rate
-                        if self._feasible_counts is not None and self._step_counts is not None:
+                    # Fallback to self-computed metrics when ep_info does not contain them
+                    if (feasible_rate == 0.0 and 'feasible_rate' not in ep_info) or (
+                        success_rate == 0.0 and 'success_rate' not in ep_info):
+                        if i < self._n_envs:
                             steps = max(1, self._step_counts[i])
                             feasible_rate = float(self._feasible_counts[i]) / float(steps)
-                        
-                        # Success rate
-                        if self._success_counts is not None and self._step_counts is not None:
-                            steps = max(1, self._step_counts[i])
                             success_rate = float(self._success_counts[i]) / float(steps)
-                        
-                        # Mean mIoU
-                        if self._miou_sums is not None and self._miou_counts is not None:
-                            if self._miou_counts[i] > 0:
+                            if self._miou_counts is not None and self._miou_counts[i] > 0:
                                 mean_miou = self._miou_sums[i] / self._miou_counts[i]
-                        
-                        # Mean latency
-                        if self._latency_sums is not None and self._latency_counts is not None:
-                            if self._latency_counts[i] > 0:
+                            if self._latency_counts is not None and self._latency_counts[i] > 0:
                                 mean_latency = self._latency_sums[i] / self._latency_counts[i]
                         
                         # Reset counters for this env
@@ -875,6 +868,31 @@ def _build_single_env(sim_config_path: str,
         env = SatelliteEnv(sim_config=sim_config, sat_configs=sat_configs)
         if use_action_wrapper:
             env = FlattenedDictActionWrapper(env)
+        # Ensure required info keys always exist to avoid Monitor KeyError
+        required_keys = [
+            "total_latency",
+            "calculated_k",
+            "miou",
+            "feasible",
+            "reward_mode",
+            "chosen_slice_size",
+            "reward",
+        ]
+        class InfoPaddingWrapper(gym.Wrapper):
+            def step(self, action):
+                obs, reward, terminated, truncated, info = self.env.step(action)
+                if isinstance(info, dict):
+                    for k in required_keys:
+                        if k not in info:
+                            # Provide sensible defaults
+                            if k == "feasible":
+                                info[k] = False
+                            elif k == "reward_mode":
+                                info[k] = "unknown"
+                            else:
+                                info[k] = 0.0
+                return obs, reward, terminated, truncated, info
+        env = InfoPaddingWrapper(env)
         # Sanitize observations to avoid NaN/Inf propagating to the policy
         env = ObservationSanitizer(env, nan_value=0.0, posinf=1e9, neginf=-1e9, clip=None)
         # Optional ObservationScaler (default enabled)
