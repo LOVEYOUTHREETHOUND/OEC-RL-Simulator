@@ -522,6 +522,296 @@ class SatelliteEnv(gym.Env):
 
         return self._get_obs(), {}
 
+    # def _calculate_latency_and_reward(self, k: int, assignment: np.ndarray, slice_size: int, overlap_ratio: float) -> Tuple[float, float, float, bool, Dict[str, Any]]:
+    #     """
+    #     Calculate latency and reward for the current task decision.
+    #     Modified logic per user's requirement:
+    #     - Fixed task size (handled by generator), per-slice data bits = slice_size*slice_size*24
+    #     - Compute per-slice FLOPs from empirical table by slice_size
+    #     - Network transmission uses per-slice bits; source->leader sends ALL k slices; leader->dest sends
+    #       assigned slices per destination.
+    #     - Reward uses hard constraint: reward=xm if total_latency<=max_latency else 0
+    #     """
+    #     if not self.current_task or not self.current_leader_satellite:
+    #         return 0.0, 0.0, 0.0, False, {}
+
+    #     source_sat = self.current_task.origin
+    #     leader_node = self.current_leader_satellite
+
+    #     # Per-slice bits based on 24 bpp and chosen slice_size
+    #     slice_pixels = float(slice_size * slice_size)
+    #     slice_data_size_bits = float(slice_pixels * 24.0)
+
+    #     # FLOPs per slice based on empirical table (GFLOPs)
+    #     flops_table_gflops = {
+    #         128: 21.73,
+    #         256: 86.90,
+    #         512: 347.60,
+    #         1024: 1390.0,  # 1.39 TFLOPs
+    #         2048: 5560.0,  
+    #     }
+    #     # nearest key
+    #     nearest_key = min(flops_table_gflops.keys(), key=lambda s: abs(s - slice_size))
+    #     slice_flops = float(flops_table_gflops[nearest_key]) * 1e9  # convert to FLOPs
+
+    #     debug: Dict[str, Any] = {
+    #         'task_id': self.current_task.id,
+    #         'width': int(self.current_task.width),
+    #         'height': int(self.current_task.height),
+    #         'max_latency_sec': float(self.current_task.max_latency_sec),
+    #         'k_slices': int(k),
+    #         'per_slice_bits': float(slice_data_size_bits),
+    #         'per_slice_flops': float(slice_flops),
+    #     }
+
+    #     # Initial hop: source RS -> leader via ISL (send ALL k slices)
+    #     dist_rs_leader = links.get_distance_km(source_sat.position_ecef, leader_node.position_ecef)
+    #     isl_cap_rs_leader = links.get_isl_capacity_bps(dist_rs_leader, self.isl_frequency_ghz)
+    #     t_initial_tx = (k * slice_data_size_bits) / isl_cap_rs_leader if isl_cap_rs_leader > 0 else np.inf
+    #     t_initial_prop = (dist_rs_leader * 1000.0) / constants.SPEED_OF_LIGHT_M_S
+    #     t_initial = t_initial_tx + t_initial_prop
+    #     debug['source_to_leader'] = {
+    #         'distance_km': float(dist_rs_leader),
+    #         'isl_capacity_bps': float(isl_cap_rs_leader),
+    #         't_initial_sec': float(t_initial),           # tx + propagation
+    #         't_initial_tx_sec': float(t_initial_tx),     # tx only (for diagnostics)
+    #         't_prop_sec': float(t_initial_prop),
+    #     }
+
+    #     latencies: List[float] = []
+    #     per_dest: List[Dict[str, Any]] = []
+
+    #     # Get the nearest compute satellites and ground station for this observation
+    #     nearest_compute = self._find_nearest_compute_satellites(
+    #         leader_node.position_ecef,
+    #         self.num_nearest_compute
+    #     )
+    #     nearest_gs = self._find_nearest_ground_station(leader_node.position_ecef)
+
+    #     # Build destination list: nearest_compute + nearest_gs
+    #     destinations = nearest_compute + ([nearest_gs] if nearest_gs else [])
+
+    #     # Process assignment
+    #     for dest_idx, group in itertools.groupby(sorted(enumerate(assignment[:k]), key=lambda x: x[1]), key=lambda x: x[1]):
+    #         indices = list(group)
+    #         num_slices_for_dest = len(indices)
+    #         entry: Dict[str, Any] = {
+    #             'dest_index': int(dest_idx),
+    #             'num_slices': int(num_slices_for_dest),
+    #         }
+
+    #         if dest_idx < len(destinations):
+    #             dest_node = destinations[dest_idx]
+    #             entry['node_type'] = dest_node.node_type
+    #             entry['node_compute_gflops'] = float(dest_node.compute_gflops)
+
+    #             if dest_node.node_type == "GROUND_STATION":
+    #                 # Downlink to ground station
+    #                 dist = links.get_distance_km(leader_node.position_ecef, dest_node.position_ecef)
+    #                 capacity = links.get_downlink_capacity_bps(dist, self.downlink_frequency_ghz)
+    #                 t_down_tx = (num_slices_for_dest * slice_data_size_bits) / capacity if capacity > 0 else np.inf
+    #                 t_down_prop = (dist * 1000.0) / constants.SPEED_OF_LIGHT_M_S
+    #                 t_trans = t_down_tx + t_down_prop
+    #                 t_comp = (num_slices_for_dest * slice_flops) / (dest_node.compute_gflops * 1e9)
+    #                 total = t_initial + t_trans + t_comp
+
+    #                 entry.update({
+    #                     'distance_km': float(dist),
+    #                     'downlink_capacity_bps': float(capacity),
+    #                     't_trans_sec': float(t_trans),            # tx + propagation
+    #                     't_trans_tx_sec': float(t_down_tx),       # tx only
+    #                     't_prop_sec': float(t_down_prop),
+    #                     't_comp_sec': float(t_comp),
+    #                     'path_latency_sec': float(total),
+    #                 })
+    #                 latencies.append(total)
+    #             else:
+    #                 # ISL to compute satellite (LEO or MEO)
+    #                 dist_isl = links.get_distance_km(leader_node.position_ecef, dest_node.position_ecef)
+    #                 isl_capacity = links.get_isl_capacity_bps(dist_isl, self.isl_frequency_ghz)
+    #                 t_isl_tx = (num_slices_for_dest * slice_data_size_bits) / isl_capacity if isl_capacity > 0 else np.inf
+    #                 t_isl_prop = (dist_isl * 1000.0) / constants.SPEED_OF_LIGHT_M_S
+    #                 t_isl = t_isl_tx + t_isl_prop
+    #                 queue_before = dest_node.get_queue_load_flops()
+    #                 t_queue = queue_before / (dest_node.compute_gflops * 1e9)
+    #                 t_comp = (num_slices_for_dest * slice_flops) / (dest_node.compute_gflops * 1e9)
+
+    #                 # Add task to queue (in FLOPs)
+    #                 task_flops = num_slices_for_dest * slice_flops
+    #                 dest_node.add_task_slice(self.current_task.id, dest_idx, task_flops,
+    #                                        self.orbit_propagator.simulation_time.timestamp())
+
+    #                 total = t_initial + t_isl + t_queue + t_comp
+    #                 entry.update({
+    #                     'distance_km': float(dist_isl),
+    #                     'isl_capacity_bps': float(isl_capacity),
+    #                     'queue_load_flops_before': float(queue_before),
+    #                     't_isl_sec': float(t_isl),               # tx + propagation
+    #                     't_isl_tx_sec': float(t_isl_tx),         # tx only
+    #                     't_prop_sec': float(t_isl_prop),
+    #                     't_queue_sec': float(t_queue),
+    #                     't_comp_sec': float(t_comp),
+    #                     'path_latency_sec': float(total),
+    #                 })
+    #                 latencies.append(total)
+    #         else:
+    #             entry['error'] = 'dest_index_out_of_range'
+    #             latencies.append(np.inf)
+    #         per_dest.append(entry)
+
+    #     total_latency_sec = max(latencies) if latencies else 0.0
+
+    #     # Reward: hard constraint on latency, reward equals mIoU otherwise 0
+    #     feasible = bool((total_latency_sec > 0) and (not np.isinf(total_latency_sec)) and (total_latency_sec <= float(self.current_task.max_latency_sec)))
+
+    #     # mIoU from explicit mapping by slice_size (nearest-key fallback)
+    #     miou_map = {
+    #         128: 0.40,
+    #         256: 0.55,
+    #         512: 0.70,
+    #         1024: 0.82,
+    #         2048: 0.90,
+    #     }
+    #     nearest_key_m = min(miou_map.keys(), key=lambda s: abs(s - slice_size))
+    #     xm = float(miou_map[nearest_key_m])
+    #     xm_source = 'discrete_map'
+
+    #     reward = float(xm) if feasible else 0.0
+
+    #     debug.update({
+    #         'destinations': per_dest,
+    #         'total_latency_sec': float(total_latency_sec),
+    #         'max_latency_sec': float(self.current_task.max_latency_sec),
+    #         'reward': float(reward),
+    #         'feasible': feasible,
+    #     })
+    #     if self.debug_latency:
+    #         self._last_latency_debug = debug
+
+    #     # return total_latency_sec, reward, xm, feasible, debug
+
+    #     debug: Dict[str, Any] = {
+    #         'task_id': self.current_task.id,
+    #         'width': int(self.current_task.width),
+    #         'height': int(self.current_task.height),
+    #         'max_latency_sec': float(self.current_task.max_latency_sec),
+    #         'data_size_bits': int(self.current_task.data_size_bits),
+    #         'required_flops': float(self.current_task.required_flops),
+    #         'k_slices': int(k),
+    #     }
+
+    #     # Initial hop: source RS -> leader via ISL
+    #     dist_rs_leader = links.get_distance_km(source_sat.position_ecef, leader_node.position_ecef)
+    #     isl_cap_rs_leader = links.get_isl_capacity_bps(dist_rs_leader, self.isl_frequency_ghz)
+    #     t_initial = (self.current_task.data_size_bits) / isl_cap_rs_leader if isl_cap_rs_leader > 0 else np.inf
+    #     debug['source_to_leader'] = {
+    #         'distance_km': float(dist_rs_leader),
+    #         'isl_capacity_bps': float(isl_cap_rs_leader),
+    #         't_initial_sec': float(t_initial),
+    #     }
+
+    #     latencies: List[float] = []
+    #     per_dest: List[Dict[str, Any]] = []
+        
+    #     # Get the nearest compute satellites and ground station for this observation
+    #     nearest_compute = self._find_nearest_compute_satellites(
+    #         leader_node.position_ecef, 
+    #         self.num_nearest_compute
+    #     )
+    #     nearest_gs = self._find_nearest_ground_station(leader_node.position_ecef)
+        
+    #     # Build destination list: nearest_compute + nearest_gs
+    #     destinations = nearest_compute + ([nearest_gs] if nearest_gs else [])
+
+    #     # Process assignment
+    #     for dest_idx, group in itertools.groupby(sorted(enumerate(assignment[:k]), key=lambda x: x[1]), key=lambda x: x[1]):
+    #         indices = list(group)
+    #         num_slices_for_dest = len(indices)
+    #         entry: Dict[str, Any] = {
+    #             'dest_index': int(dest_idx),
+    #             'num_slices': int(num_slices_for_dest),
+    #         }
+            
+    #         if dest_idx < len(destinations):
+    #             dest_node = destinations[dest_idx]
+    #             entry['node_type'] = dest_node.node_type
+    #             entry['node_compute_gflops'] = float(dest_node.compute_gflops)
+
+    #             if dest_node.node_type == "GROUND_STATION":
+    #                 # Downlink to ground station
+    #                 dist = links.get_distance_km(leader_node.position_ecef, dest_node.position_ecef)
+    #                 capacity = links.get_downlink_capacity_bps(dist, self.downlink_frequency_ghz)
+    #                 t_trans = (num_slices_for_dest * slice_data_size_bits) / capacity if capacity > 0 else np.inf
+    #                 t_comp = (num_slices_for_dest * slice_flops) / (dest_node.compute_gflops * 1e9)
+    #                 total = t_initial + t_trans + t_comp
+
+    #                 entry.update({
+    #                     'distance_km': float(dist),
+    #                     'downlink_capacity_bps': float(capacity),
+    #                     't_trans_sec': float(t_trans),
+    #                     't_comp_sec': float(t_comp),
+    #                     'path_latency_sec': float(total),
+    #                 })
+    #                 latencies.append(total)
+    #             else:
+    #                 # ISL to compute satellite (LEO or MEO)
+    #                 dist_isl = links.get_distance_km(leader_node.position_ecef, dest_node.position_ecef)
+    #                 isl_capacity = links.get_isl_capacity_bps(dist_isl, self.isl_frequency_ghz)
+    #                 t_isl = (num_slices_for_dest * slice_data_size_bits) / isl_capacity if isl_capacity > 0 else np.inf
+    #                 queue_before = dest_node.get_queue_load_flops()
+    #                 t_queue = queue_before / (dest_node.compute_gflops * 1e9)
+    #                 t_comp = (num_slices_for_dest * slice_flops) / (dest_node.compute_gflops * 1e9)
+                    
+    #                 # Add task to queue
+    #                 task_flops = num_slices_for_dest * slice_flops
+    #                 dest_node.add_task_slice(self.current_task.id, dest_idx, task_flops, 
+    #                                        self.orbit_propagator.simulation_time.timestamp())
+                    
+    #                 total = t_initial + t_isl + t_queue + t_comp
+    #                 entry.update({
+    #                     'distance_km': float(dist_isl),
+    #                     'isl_capacity_bps': float(isl_capacity),
+    #                     'queue_load_flops_before': float(queue_before),
+    #                     't_isl_sec': float(t_isl),
+    #                     't_queue_sec': float(t_queue),
+    #                     't_comp_sec': float(t_comp),
+    #                     'path_latency_sec': float(total),
+    #                 })
+    #                 latencies.append(total)
+    #         else:
+    #             entry['error'] = 'dest_index_out_of_range'
+    #             latencies.append(np.inf)
+    #         per_dest.append(entry)
+
+    #     total_latency_sec = max(latencies) if latencies else 0.0
+        
+    #     # Feasibility and mIoU-hard-constraint reward
+    #     feasible = bool((total_latency_sec > 0) and (not np.isinf(total_latency_sec)) and (total_latency_sec <= float(self.current_task.max_latency_sec)))
+
+    #     miou_map = {
+    #         128: 0.40,
+    #         256: 0.55,
+    #         512: 0.70,
+    #         1024: 0.82,
+    #         2048: 0.90,
+    #     }
+    #     nearest_key_m = min(miou_map.keys(), key=lambda s: abs(s - slice_size))
+    #     xm = float(miou_map[nearest_key_m])
+
+    #     reward = float(xm) if feasible else 0.0
+        
+    #     debug.update({
+    #         'destinations': per_dest,
+    #         'total_latency_sec': float(total_latency_sec),
+    #         'max_latency_sec': float(self.current_task.max_latency_sec),
+    #         'reward': float(reward),
+    #         'feasible': bool(feasible),
+    #     })
+    #     if self.debug_latency:
+    #         self._last_latency_debug = debug
+
+    #     return total_latency_sec, float(reward), float(xm), bool(feasible), debug
+
     def _calculate_latency_and_reward(self, k: int, assignment: np.ndarray, slice_size: int, overlap_ratio: float) -> Tuple[float, float, float, bool, Dict[str, Any]]:
         """
         Calculate latency and reward for the current task decision.
